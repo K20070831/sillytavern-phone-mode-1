@@ -89,11 +89,24 @@
     }
 
     // ========== 短信历史双写存储 ==========
+    // __pmSaveSeq：每次落盘 +1，只增不减。loadHistoriesFromIDB 用它判断「读 IDB 期间内存有没有被改过」。
+    // __pmPendingSave：最近一次 IDB 写入的 promise，读之前 await 它，避免读到还没提交的旧数据。
+    let __pmSaveSeq = 0;
+    let __pmPendingSave = Promise.resolve();
+
     function saveHistories() {
-        pmIDBSet('ST_SMS_DATA_V2', window.__pmHistories).catch(() => {});
+        __pmSaveSeq++;
+        // localStorage 是同步的，先写它：这样即使 IDB 那边还没提交、或者页面马上被关掉，
+        // 也有一份当场就落地的副本
         try { localStorage.setItem('ST_SMS_DATA_V2', JSON.stringify(window.__pmHistories)); } catch (e) {
             console.warn('[phone-mode] localStorage 已满，短信历史仅保存在 IDB');
         }
+        // 串行排队而不是并发写：IDB 事务本身有序，但 pmIDBSet 里 await pmOpenIDB() 之后才建事务，
+        // 并发时后发的写可能先建事务先提交，末尾那条反而被压掉
+        __pmPendingSave = __pmPendingSave
+            .then(() => pmIDBSet('ST_SMS_DATA_V2', window.__pmHistories))
+            .catch(() => {});
+        return __pmPendingSave;
     }
 
     // 修复：页面关闭/刷新时 IDB 异步写入可能来不及完成，用 beforeunload 做同步兜底
@@ -118,8 +131,11 @@
                 console.warn('[phone-mode] beforeunload: localStorage 完全无法写入');
             }
         }
-        // ✅ 新增：同时触发 IDB 异步写入，iOS 后台挂起前尽量完成
-        pmIDBSet('ST_SMS_DATA_V2', data).catch(() => {});
+        // ✅ 同时触发 IDB 异步写入，iOS 后台挂起前尽量完成。
+        // 挂到同一条队列上，别和 saveHistories 排队中的写入抢事务顺序
+        __pmPendingSave = __pmPendingSave
+            .then(() => pmIDBSet('ST_SMS_DATA_V2', data))
+            .catch(() => {});
     }
 
     // 避免重复加载插件时重复注册
@@ -133,11 +149,31 @@
         window.__pmBeforeUnloadRegistered = true;
     }
 
+    // 这个函数会整体替换 window.__pmHistories，所以它必须保证「不能拿旧数据盖掉新数据」。
+    // 聊天记录丢失（重开手机 / 切联系人再切回来，丢最近一条角色回复）的根因就在这里：
+    //   1. __pmEnd 落盘时 pmIDBSet 没被 await，手机随即关闭 → 写入可能还没提交
+    //   2. __pmEnd 又把 __pmFirstOpen 置回 true，于是下次打开必走冷启动
+    //   3. 冷启动调这个函数，读到的是没提交前的旧数据，无条件盖掉内存里正确的记录
+    //   4. 更糟的是接着又把这份旧数据写回 localStorage，把唯一正确的副本也污染了
+    // 两道防线：读之前 await 未完成的写；读完再确认这期间内存没被改过。
     async function loadHistoriesFromIDB() {
+        // seq 必须在任何 await 之前同步取：等 __pmPendingSave 的过程中用户也可能发消息，
+        // 取晚了那次自增已经被算进 seqBefore，就检测不出来了（实测会丢数据）
+        const seqBefore = __pmSaveSeq;
+        const hasMem = Object.keys(window.__pmHistories || {}).length > 0;
+        // 防线二：读 IDB 是异步的，这期间用户可能已经发了消息或切了联系人。
+        // 只要 seq 变了就说明内存比 IDB 新，这次读取结果整份作废。
+        // 「丢弃读取结果」永远是安全的（内存要么一样新要么更新），「采纳」才有风险。
+        const isStale = () => __pmSaveSeq !== seqBefore;
+        // 防线一：等排队中的写入落地，避免读到自己刚写、但还没提交的数据
+        try { await __pmPendingSave; } catch (e) {}
         try {
             const v = await pmIDBGet('ST_SMS_DATA_V2');
+            if (isStale()) { console.log('[phone-mode] 读 IDB 期间内存已更新，丢弃本次读取'); return; }
             if (!v) {
                 // ✅ IDB 无数据（包括 IDB 失效返回 null 的情况），用 localStorage 兜底
+                // 内存已有数据时不动它：内存要么就是这份数据，要么比它新
+                if (hasMem) return;
                 try {
                     const ls = JSON.parse(localStorage.getItem('ST_SMS_DATA_V2'));
                     if (ls && typeof ls === 'object' && Object.keys(ls).length > 0) {
@@ -151,6 +187,7 @@
             if (!parsed || typeof parsed !== 'object') return;
             const idbCount = Object.keys(parsed).length;
             if (idbCount > 0) {
+                if (isStale()) { console.log('[phone-mode] 读 IDB 期间内存已更新，丢弃本次读取'); return; }
                 window.__pmHistories = parsed;
                 try { localStorage.setItem('ST_SMS_DATA_V2', JSON.stringify(parsed)); } catch (e) {
                     console.warn('[phone-mode] localStorage 已满，仅使用 IDB 存储');
@@ -160,6 +197,8 @@
         } catch (e) {
             // ✅ IDB 读取异常（iOS WebView 后台恢复时的典型情况），用 localStorage 兜底
             console.warn('[phone-mode] IDB 恢复失败，尝试 localStorage 兜底', e);
+            // 同样不能盖掉更新的内存数据
+            if (isStale() || hasMem) return;
             try {
                 const ls = JSON.parse(localStorage.getItem('ST_SMS_DATA_V2'));
                 if (ls && typeof ls === 'object' && Object.keys(ls).length > 0) {
@@ -173,7 +212,7 @@
     window.__pmConfig = window.__pmConfig || { apiUrl: '', apiKey: '', model: '', useIndependent: false };
     window.__pmProfiles = window.__pmProfiles || [];
     window.__pmBidirectional = window.__pmBidirectional || {};
-    window.__pmTheme = window.__pmTheme || { preset: 'default', customRight: '', customLeft: '', borderColor: '', layout: 'standard', darkMode: 'light' };
+    window.__pmTheme = window.__pmTheme || { preset: 'default', customRight: '', customLeft: '', borderColor: '', layout: 'standard', darkMode: 'light', borderFx: 'none' };
     window.__pmBgGlobal = window.__pmBgGlobal || '';
     window.__pmBgLocal = window.__pmBgLocal || {};
     window.__pmGroupMeta = window.__pmGroupMeta || {};
@@ -488,6 +527,15 @@
         return (r*0.299 + g*0.587 + b*0.114) > 150 ? '#000' : '#fff';
     }
 
+    // 边框半透明/磨砂要的是带 alpha 的边框色。取色器只给 #rrggbb,这里转成 rgba()
+    function hexAlpha(hex, a) {
+        const c = (hex || '').replace('#', '');
+        if (c.length !== 6) return `rgba(26,26,26,${a})`;
+        const r = parseInt(c.substr(0,2),16), g = parseInt(c.substr(2,2),16), b = parseInt(c.substr(4,2),16);
+        if ([r,g,b].some(Number.isNaN)) return `rgba(26,26,26,${a})`;
+        return `rgba(${r},${g},${b},${a})`;
+    }
+
     function loadTheme() { try { window.__pmTheme = { ...window.__pmTheme, ...JSON.parse(localStorage.getItem('ST_SMS_THEME')) }; } catch (e) {} }
     function saveTheme() { try { localStorage.setItem('ST_SMS_THEME', JSON.stringify(window.__pmTheme)); } catch (e) {} }
     function loadPokeConfig() { try { window.__pmPokeConfig = JSON.parse(localStorage.getItem('ST_SMS_POKE_CONFIG')) || {}; } catch (e) { window.__pmPokeConfig = {}; } }
@@ -571,6 +619,10 @@
         el.style.setProperty('--pm-r-txt', rTxt); el.style.setProperty('--pm-l-txt', lTxt);
         el.style.setProperty('--pm-border', border);
         el.style.setProperty('--pm-frost', p.frost ? '1' : '0');
+        // 边框效果:磨砂/半透明各自要一档不同的 alpha,描边不动透明度
+        const bfx = t.borderFx || 'none';
+        el.style.setProperty('--pm-border-a', hexAlpha(border, bfx === 'frost' ? 0.55 : 0.4));
+        el.setAttribute('data-bfx', bfx);
         const darkMode = t.darkMode || 'light';
         el.setAttribute('data-theme', darkMode);
     }
@@ -716,13 +768,25 @@
     const EMO_RE = /\[emo:([^\]:]+):(\d+)\]/gi;
     // 查找表情包图片：先按套组名+序号精确匹配，返回 url 或 null
     function findEmojiUrl(setName, idx) {
-        const set = window.__pmEmojis.find(s => s.name === setName);
-        if (!set) return null;
-        const img = set.images[idx - 1]; // 序号从1开始
+        const set = (window.__pmEmojis || []).find(s => s?.name === setName);
+        // images 可能不存在（手工导入的表情包组），idx 来自 AI 输出的 [emo:名:序号]，不能信
+        if (!set || !Array.isArray(set.images)) return null;
+        const n = Number(idx);
+        if (!Number.isInteger(n) || n < 1) return null;
+        const img = set.images[n - 1]; // 序号从1开始
         return img ? img.url : null;
     }
 
+    // 手机打开期间钉住的 storageId。
+    // 酒馆切角色卡时先改 context 再发 CHAT_CHANGED，__pmEnd() 在事件里落盘时
+    // getCtx() 已经指向新卡，算出来的 key 是新卡的，旧卡的聊天记录就被写进了新卡
+    // ——这就是"联系人和记录跨卡复制"的来源。开机时钉住，关机前一律用钉住的值。
+    let __pmPinnedStorageId = '';
     function getStorageId() {
+        if (phoneActive && __pmPinnedStorageId) return __pmPinnedStorageId;
+        return computeStorageId();
+    }
+    function computeStorageId() {
         const c = getCtx(); if (!c) return 'sms_unknown__default';
         const char = c.characters?.[c.characterId];
         const avatar = char?.avatar || `idx_${c.characterId}`;
@@ -730,6 +794,13 @@
         // 恢复使用 chatId 以区分不同角色卡（纯去掉 chatId 会导致同名头像的卡串记录）
         // 之前报告的"记录消失"真正原因是 localStorage 被旧数据覆盖，已在 __pmOpen 里修复
         return `sms_${avatar}__${chatFile}`;
+    }
+
+    // 备忘录和微博按联系人隔离：key = storageId + '_p_' + persona（空时退回 storageId）
+    function getPersonaStorageId() {
+        const base = getStorageId();
+        const p = (isGroupChat ? currentGroupKey : currentPersona) || '';
+        return p ? `${base}_p_${p}` : base;
     }
 
     function migrateOldHistory() {
@@ -1056,7 +1127,10 @@
                 const amount = parseFloat(m[2]) || 0;
                 b.innerHTML = `<div class="pm-refund-card"><div class="pm-t-icon">¥</div><div class="pm-t-info"><b>已退还</b><span>¥${amount.toFixed(2)}</span></div></div>`;
             } else if (kind === '图片') {
-                b.innerHTML = `<div class="pm-img-card" data-desc="${escapeAttr(m[2].trim())}" role="button" tabindex="0" onclick="window.__pmGenChatImg(this)">🖼️ ${escapeHtml(m[2].trim())}</div>`;
+                const imgEnabled = !!(window.__pmConfig?.img?.provider);
+                b.innerHTML = imgEnabled
+                    ? `<div class="pm-img-card" data-desc="${escapeAttr(m[2].trim())}" role="button" tabindex="0" onclick="window.__pmGenChatImg(this)">🖼️ ${escapeHtml(m[2].trim())}</div>`
+                    : `<div class="pm-img-card pm-img-card-disabled">🖼️ ${escapeHtml(m[2].trim())}</div>`;
             } else {
                 const txt = m[2].trim(), len = [...txt].length;
                 let dur;
@@ -1070,7 +1144,8 @@
                     voiceStyle = `width:${width}px;background:${gc.bg} !important;color:${gc.text} !important;`;
                     voiceClass = 'pm-voice-card pm-voice-left pm-voice-group';
                 }
-                b.innerHTML = `<div class="pm-voice-wrap"><div class="pm-voice-row"><div class="${voiceClass}" style="${voiceStyle}" onclick="window.__pmToggleVoice(this)"><span class="pm-voice-icon">🎤</span><span class="pm-voice-wave"><i></i><i></i><i></i></span><span class="pm-voice-dur">${dur}"</span></div><span class="pm-voice-play" role="button" tabindex="0" title="朗读" onclick="event.stopPropagation();window.__pmPlayTTS(this)">🔊</span></div><div class="pm-voice-text" style="display:none;">${escapeHtml(txt)}</div></div>`;
+                const ttsEnabled = !!(window.__pmConfig?.tts?.provider);
+                b.innerHTML = `<div class="pm-voice-wrap"><div class="pm-voice-row"><div class="${voiceClass}" style="${voiceStyle}" onclick="window.__pmToggleVoice(this)"><span class="pm-voice-icon">🎤</span><span class="pm-voice-wave"><i></i><i></i><i></i></span><span class="pm-voice-dur">${dur}"</span></div>${ttsEnabled ? `<span class="pm-voice-play" role="button" tabindex="0" title="朗读" onclick="event.stopPropagation();window.__pmPlayTTS(this)">🔊</span>` : ''}</div><div class="pm-voice-text" style="display:none;">${escapeHtml(txt)}</div></div>`;
             }
             if (container) { container.appendChild(b); results.push(container); }
             else results.push(b);
@@ -1110,10 +1185,11 @@
 
     window.__pmTtsProviderChange = () => {
         const p = document.getElementById('pm-tts-provider')?.value || '';
-        const show = (id, v) => { const el = document.getElementById(id); if (el) el.style.display = v ? '' : 'none'; };
+        // 显示时必须写回 flex：清空 display 会退回 block，让容器上的 gap 失效
+        const show = (id, v, mode) => { const el = document.getElementById(id); if (el) el.style.display = v ? (mode || '') : 'none'; };
         show('pm-tts-url', p && p !== 'doubao');
         show('pm-tts-key', !!p);
-        show('pm-tts-doubao-row', p === 'doubao');
+        show('pm-tts-doubao-row', p === 'doubao', 'flex');
         show('pm-tts-voice', !!p);
         show('pm-tts-model-row', p === 'openai' || p === 'minimax');
     };
@@ -1225,6 +1301,16 @@
     const PM_IMG_PER_CHAT = 30;
     const PM_IMG_GLOBAL   = 300;
 
+    // 未启用时把下面的输入框全收起来，省得看着像要填
+    window.__pmImgProviderChange = () => {
+        const p = document.getElementById('pm-img-provider')?.value || '';
+        const show = (id, v) => { const el = document.getElementById(id); if (el) el.style.display = v ? '' : 'none'; };
+        show('pm-img-url', p === 'openai');
+        show('pm-img-key', !!p);
+        show('pm-img-model', !!p);
+        show('pm-img-size', !!p);
+    };
+
     window.__pmImgUiLoad = () => {
         const c = window.__pmConfig.img || {};
         const f = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
@@ -1233,6 +1319,7 @@
         f('pm-img-key', c.key);
         f('pm-img-model', c.model);
         f('pm-img-size', c.size || '1024x1024');
+        window.__pmImgProviderChange();
     };
 
     window.__pmImgSave = () => {
@@ -1329,7 +1416,7 @@
     // 聊天侧：点击 pm-img-card 生图
     window.__pmGenChatImg = async (el) => {
         const cfg = window.__pmConfig.img || {};
-        if (!cfg.provider) return alert('请先在设置 → 图像 里配置生图 API');
+        if (!cfg.provider) return alert('请先在设置 → 其他 里配置生图 API');
         const desc = el.dataset.desc;
         if (!desc) return;
         await pmImgLoad();
@@ -1362,7 +1449,7 @@
     // 微博侧：点击 .wb-img 占位格生图
     window.__pmGenWbImg = async (el, pid, imgIdx) => {
         const cfg = window.__pmConfig.img || {};
-        if (!cfg.provider) return alert('请先在设置 → 图像 里配置生图 API');
+        if (!cfg.provider) return alert('请先在设置 → 其他 里配置生图 API');
         const desc = el.dataset.desc;
         if (!desc) return;
         await pmImgLoad();
@@ -2945,6 +3032,10 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         const layoutBtns = ['standard', 'relaxed'].map(v =>
             `<div class="pm-layout-chip ${t.layout === v ? 'pm-layout-active' : ''}" onclick="window.__pmSetLayout('${safeJS(v)}')">${v === 'standard' ? '标准' : '宽松'}</div>`
         ).join('');
+        const bfxLabels = { none: '无', frost: '磨砂', glass: '半透明', rim: '描边' };
+        const borderFxBtns = ['none', 'frost', 'glass', 'rim'].map(v =>
+            `<div class="pm-layout-chip ${(t.borderFx || 'none') === v ? 'pm-layout-active' : ''}" data-bfx="${v}" onclick="window.__pmSetBorderFx('${safeJS(v)}')">${bfxLabels[v]}</div>`
+        ).join('');
         const id = getStorageId(), localKey = `${id}_${currentPersona}`;
         const hasGlobalBg = !!window.__pmBgGlobal, hasLocalBg = !!window.__pmBgLocal[localKey];
         const globalBgBtn = hasGlobalBg
@@ -2961,7 +3052,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
   <div class="pm-cfg-tabs">
     <div class="pm-cfg-tab pm-cfg-tab-active" data-tab="api" onclick="window.__pmSwitchTab('api')">API</div>
     <div class="pm-cfg-tab" data-tab="look" onclick="window.__pmSwitchTab('look')">外观</div>
-    <div class="pm-cfg-tab" data-tab="image" onclick="window.__pmSwitchTab('image')">图像</div>
+    <div class="pm-cfg-tab" data-tab="image" onclick="window.__pmSwitchTab('image')">高级</div>
     <div class="pm-cfg-tab" data-tab="other" onclick="window.__pmSwitchTab('other')">其他</div>
   </div>
   <div class="pm-modal-scroll">
@@ -2995,9 +3086,8 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
           <button onclick="window.__pmTestModel()" style="flex:1;background:#5856d6;color:#fff;border:none;border-radius:10px;padding:9px;font-size:12px;cursor:pointer;font-weight:600;">🧪 测试</button>
         </div>
       </div>
-      <div style="height:12px;"></div>
     </div>
-    
+
     <div id="pm-tab-look" class="pm-tab-pane" style="display:none;">
       <div style="padding:12px 16px 0;"> <div class="pm-cfg-label" style="margin-bottom:8px;">🌓 日夜模式</div>
         <div class="pm-theme-row" style="margin-bottom:8px;"> <div class="pm-layout-chip ${t.darkMode === 'light' ? 'pm-layout-active' : ''}" onclick="window.__pmSetDarkMode('light')">☀️ 日间</div>
@@ -3018,10 +3108,17 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
           <input id="pm-custom-left" type="color" value="${t.customLeft || '#e9e9eb'}" onchange="window.__pmSetCustomColor()" class="pm-color-pick">
           <button onclick="window.__pmClearCustomColor()" class="pm-color-clear">重置</button>
         </div>
-        <div style="display:flex;gap:8px;margin-top:12px;align-items:center;">
-          <label class="pm-cfg-label" style="margin:0;">边框颜色</label>
+      </div>
+      <div style="padding:14px 16px 12px;border-top:1px solid #f0f0f0;">
+        <div class="pm-cfg-label" style="margin-bottom:10px;">📱 机身边框</div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <label class="pm-cfg-label" style="margin:0;flex-shrink:0;">颜色</label>
           <input id="pm-border-color" type="color" value="${t.borderColor || '#1a1a1a'}" onchange="window.__pmSetBorderColor()" class="pm-color-pick">
           <button onclick="document.getElementById('pm-border-color').value='#1a1a1a';window.__pmSetBorderColor()" class="pm-color-clear">重置</button>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;align-items:center;">
+          <label class="pm-cfg-label" style="margin:0;flex-shrink:0;">效果</label>
+          <div id="pm-bfx-row" class="pm-layout-row">${borderFxBtns}</div>
         </div>
       </div>
       <div style="padding:12px 16px 12px;border-top:1px solid #f0f0f0;">
@@ -3037,7 +3134,6 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
           </div>
         </div>
       </div>
-      <div style="height:12px;"></div>
     </div>
     <div id="pm-tab-image" class="pm-tab-pane" style="display:none;">
       <div style="padding:14px 16px 12px;border-bottom:1px solid #f0f0f0;">
@@ -3066,18 +3162,20 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         <button onclick="window.__pmAddNpcAvSet()" style="width:100%;margin-top:8px;background:#007aff;color:#fff;border:none;border-radius:10px;padding:10px;font-size:13px;cursor:pointer;font-weight:600;">➕ 添加新头像组</button>
         <div class="pm-cfg-tip" style="text-align:left;margin-top:6px;">勾选启用的组会被微博评论区取用；头像不够时其余NPC用灰色占位。最多 10 组，每组最多 30 张</div>
       </div>
-      <div style="padding:12px 16px 12px;">
+    </div>
+    <div id="pm-tab-other" class="pm-tab-pane" style="display:none;">
+      <div style="padding:12px 16px 12px;border-bottom:1px solid #f0f0f0;">
         <div class="pm-cfg-label" style="margin-bottom:10px;">🎨 AI 生图</div>
         <div style="display:flex;flex-direction:column;gap:8px;">
-          <select id="pm-img-provider" class="pm-cfg-input" style="padding:8px 10px;">
+          <select id="pm-img-provider" class="pm-cfg-input" style="padding:8px 10px;" onchange="window.__pmImgProviderChange()">
             <option value="">— 未启用 —</option>
             <option value="openai">OpenAI / 兼容接口</option>
             <option value="nai">NovelAI (NAI)</option>
           </select>
-          <input id="pm-img-url" class="pm-cfg-input" placeholder="API 地址（OpenAI 兼容时填，NAI 留空）">
-          <input id="pm-img-key" class="pm-cfg-input" placeholder="API Key">
-          <input id="pm-img-model" class="pm-cfg-input" placeholder="模型（OpenAI: dall-e-3 | NAI: nai-diffusion-4-5）">
-          <select id="pm-img-size" class="pm-cfg-input" style="padding:8px 10px;">
+          <input id="pm-img-url" class="pm-cfg-input" placeholder="API 地址（OpenAI 兼容时填，NAI 留空）" style="display:none;">
+          <input id="pm-img-key" class="pm-cfg-input" placeholder="API Key" style="display:none;">
+          <input id="pm-img-model" class="pm-cfg-input" placeholder="模型（OpenAI: dall-e-3 | NAI: nai-diffusion-4-5）" style="display:none;">
+          <select id="pm-img-size" class="pm-cfg-input" style="padding:8px 10px;display:none;">
             <option value="1024x1024">1024×1024（方形）</option>
             <option value="832x1216">832×1216（竖图，NAI 默认）</option>
             <option value="1216x832">1216×832（横图）</option>
@@ -3085,9 +3183,6 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         </div>
         <div class="pm-cfg-tip" style="text-align:left;margin-top:6px;">配置后点击聊天/微博里的图片描述即可生成，每聊天保存 30 张，全局上限 300 张</div>
       </div>
-      <div style="height:12px;"></div>
-    </div>
-    <div id="pm-tab-other" class="pm-tab-pane" style="display:none;">
       <div style="padding:12px 16px 12px;border-bottom:1px solid #f0f0f0;">
         <div class="pm-cfg-label" style="margin-bottom:10px;">🔊 语音合成（TTS）</div>
         <div style="display:flex;flex-direction:column;gap:8px;">
@@ -3119,7 +3214,6 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         </div>
         <div class="pm-cfg-tip" style="text-align:left;margin-top:6px;color:#ff9500;">注意：导入会覆盖当前所有联系人与记录</div>
       </div>
-      <div style="height:12px;"></div>
     </div>
   </div>
   <div class="pm-modal-add" id="pm-config-bottom">
@@ -3138,10 +3232,10 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             window.__pmRenderNpcAvSetList();
             const wc = document.getElementById('pm-wordy-check');
             if (wc) wc.classList.toggle('is-checked', !!window.__pmWordyLimit);
-            window.__pmImgUiLoad();
         }
         if (tab === 'other') {
             window.__pmTtsUiLoad();
+            window.__pmImgUiLoad();
         }
     };
 
@@ -3170,8 +3264,13 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     window.__pmSetLayout = (v) => {
         window.__pmTheme.layout = v; saveTheme();
         if (phoneWindow) phoneWindow.dataset.layout = v;
-        document.querySelectorAll('.pm-layout-chip').forEach(el => el.classList.toggle('pm-layout-active', el.textContent === (v === 'standard' ? '标准' : '宽松')));
+        // 只扫布局那一行：日夜模式和边框效果也用 .pm-layout-chip,不限定范围会把它们的选中态一起抹掉
+        document.querySelectorAll('.pm-layout-row:not(#pm-bfx-row) .pm-layout-chip').forEach(el => el.classList.toggle('pm-layout-active', el.textContent === (v === 'standard' ? '标准' : '宽松')));
         fitNameFont();
+    };
+    window.__pmSetBorderFx = (v) => {
+        window.__pmTheme.borderFx = v; saveTheme(); applyTheme();
+        document.querySelectorAll('#pm-bfx-row .pm-layout-chip').forEach(el => el.classList.toggle('pm-layout-active', el.dataset.bfx === v));
     };
 
     window.__pmUploadBg = (input, scope) => {
@@ -3291,7 +3390,26 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         const histories = window.__pmHistories[id] || {};
         const groups = window.__pmGroupMeta[id] || {};
         const checked = window.__pmBidirectional[id] || [];
-        const singleList = Object.keys(histories).filter(k => !k.startsWith('__group_'));
+
+        // 有日记/微博但没聊天记录的联系人也要显示。
+        // 群聊的 persona key 是 `${id}_p___group_<ts>`，切掉前缀剩下的是群 key 而不是人名，
+        // 必须挡掉：否则群会以「__group_1785648926146」的名字混进单人列表，
+        // 而且那个幽灵条目的删除按钮走单人 __pmDel，删的正好是这个群真实的微博桶。
+        const prefix = `${id}_p_`;
+        const extraNames = new Set();
+        const addExtra = (key) => {
+            if (!key.startsWith(prefix)) return;
+            const n = key.slice(prefix.length);
+            if (!n || n.startsWith('__group_')) return;
+            extraNames.add(n);
+        };
+        for (const key of Object.keys(window.__pmMemos || {})) addExtra(key);
+        for (const key of Object.keys(window.__pmWeiboPosts || {})) addExtra(key);
+
+        const singleList = [...new Set([
+            ...Object.keys(histories).filter(k => !k.startsWith('__group_')),
+            ...extraNames
+        ])];
         const groupList = Object.keys(groups);
 
         const renderSingle = singleList.map(n => {
@@ -3299,7 +3417,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             const remark = getRemark(n);
             return `<div class="pm-li">
                 <div class="pm-custom-check pm-bi-style ${isChk ? 'is-checked' : ''}" onclick="event.stopPropagation();window.__pmToggleBidirectional('${safeJS(n)}')" style="width:20px;height:20px;min-width:20px;min-height:20px;flex-shrink:0;border-radius:50%;"></div>
-                <span onclick="window.__pmSwitchContact('${safeJS(n)}')">${escapeHtml(remark || n)}${remark ? `<span style="color:#bbb;font-size:11px;margin-left:4px;">(${escapeHtml(n)})</span>` : ''}</span>
+                <span onclick="window.__pmSwitchContact('${safeJS(n)}')">${escapeHtml(remark || n)}${remark ? `<span style="color:#9a9aa0;font-size:11px;margin-left:4px;font-weight:400;">(${escapeHtml(n)})</span>` : ''}</span>
                 <i onclick="window.__pmDel('${safeJS(n)}')">删除</i>
             </div>`;
         }).join('');
@@ -3336,7 +3454,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         ${empty ? '<div style="text-align:center;color:#999;padding:20px;font-size:13px;">暂无联系人</div>' : (renderGroups + renderSingle)}
     </div>
     <div class="pm-modal-add" style="display:flex;gap:8px;">
-        <button onclick="window.__pmShowGroupCreate()" class="pm-btn-group">👥 新建群聊</button>
+        <button onclick="window.__pmShowGroupCreate()" class="pm-btn-group">新建群聊</button>
         <button onclick="window.__pmShowAddContact()" class="pm-btn-add">＋ 添加联系人</button>
     </div>
     </div>`);
@@ -3520,6 +3638,20 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             savePokeConfig();
         }
 
+        // 群聊也按 `${id}_p_${key}` 存备忘录/微博（含名册）。不清掉的话
+        // __pmShowList 会从 __pmWeiboPosts 的 key 反查，让删掉的群在列表里复活
+        const pKey = `${id}_p_${key}`;
+        if (window.__pmMemos?.[pKey]) { delete window.__pmMemos[pKey]; await saveMemos(); }
+        let wbDirty = false;
+        if (window.__pmWeiboPosts?.[pKey]) { delete window.__pmWeiboPosts[pKey]; wbDirty = true; }
+        if (window.__pmWeiboIdentity?.[pKey]) { delete window.__pmWeiboIdentity[pKey]; wbDirty = true; }
+        if (wbDirty) await Promise.all([saveWeiboPosts(), saveWeiboIdentity()]);
+
+        if (window.__pmAvatarData?.[id]?.[key]) {
+            delete window.__pmAvatarData[id][key];
+            saveAvatarData();
+        }
+
         // 修复：await 确保 IDB 写入完成，防止冷启动时 IDB 旧数据覆盖删除操作
         await pmIDBSet('ST_SMS_DATA_V2', window.__pmHistories).catch(() => {});
         try { localStorage.setItem('ST_SMS_DATA_V2', JSON.stringify(window.__pmHistories)); } catch (e) {};
@@ -3615,6 +3747,9 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             if (editBtn) {
                 editBtn.classList.remove('is-hidden');  // 个人和群聊都显示编辑按钮
             }
+            // 群聊没有备忘录：切到群聊时把 📖 收起来
+            const memoBtn = phoneWindow.querySelector('#pm-memo-btn');
+            if (memoBtn) memoBtn.style.display = isGroupChat ? 'none' : '';
             fitNameFont();
             renderHistoryMessages();
         }
@@ -3622,6 +3757,9 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     };
 
     window.__pmDel = async (name) => {
+        // 群聊必须走 __pmDelGroup。名字带 __group_ 前缀说明是哪里反查 key 时漏了过滤，
+        // 放它进来会让 `${id}_p_${name}` 正好命中这个群真实的微博桶，把群的博文和名册删掉。
+        if (!name || String(name).startsWith('__group_')) { window.__pmShowList(); return; }
         const id = getStorageId();
         if (window.__pmHistories[id]) delete window.__pmHistories[id][name];
         // 修复：await 确保 IDB 写入完成，防止冷启动时 IDB 旧数据覆盖删除操作
@@ -3643,6 +3781,14 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             savePokeConfig();
         }
 
+        // 备忘录/微博按 `${id}_p_${name}` 分桶，不清掉的话这个联系人会靠残留数据重新出现在列表里
+        const pKey = `${id}_p_${name}`;
+        if (window.__pmMemos?.[pKey]) { delete window.__pmMemos[pKey]; await saveMemos(); }
+        let wbDirty = false;
+        if (window.__pmWeiboPosts?.[pKey]) { delete window.__pmWeiboPosts[pKey]; wbDirty = true; }
+        if (window.__pmWeiboIdentity?.[pKey]) { delete window.__pmWeiboIdentity[pKey]; wbDirty = true; }
+        if (wbDirty) await Promise.all([saveWeiboPosts(), saveWeiboIdentity()]);
+
         applyBidirectionalInjection();
         // 修复：删除当前联系人后清空全局状态，防止后续切换时落盘把已删记录写入新目标
         if (!isGroupChat && currentPersona === name) { currentPersona = ''; conversationHistory = []; }
@@ -3662,14 +3808,21 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
                 .forEach(b => {
                 if (b.id === 'pm-typing' || b.closest('.pm-select-wrap')) return;
                 const isDirector = b.classList.contains('pm-director');
+                // 开了头像时气泡在 .pm-row 里（左 [头像][气泡]、右 [气泡][头像]），
+                // 要包整行而不是气泡本身，否则复选框会插到头像和气泡中间。
+                const target = b.closest('.pm-row') || b;
+                if (target.closest('.pm-select-wrap')) return;
                 const wrap = document.createElement('div'); wrap.className = 'pm-select-wrap';
                 const side = isDirector ? 'center' : (b.dataset.side || 'left');
-                wrap.style.cssText = 'display:flex;align-items:center;gap:8px;align-self:' + (side === 'right' ? 'flex-end' : side === 'center' ? 'center' : 'flex-start') + ';';
+                // 复选框统一钉在最左边，用户和角色的对齐成一列：
+                // 整行占满宽度，气泡自己的 justify-content 继续决定左右贴边。
                 const cb = document.createElement('div'); cb.className = 'pm-custom-check'; cb.dataset.checked = '0';
-                cb.style.cssText = 'width:22px;height:22px;min-width:22px;min-height:22px;border-radius:50%;flex-shrink:0;cursor:pointer;';
+                cb.style.cssText = 'width:22px;height:22px;min-width:22px;min-height:22px;border-radius:50%;flex-shrink:0;cursor:pointer;margin-bottom:0;';
                 cb.onclick = () => { cb.dataset.checked = cb.dataset.checked === '0' ? '1' : '0'; };
-                b.parentNode.insertBefore(wrap, b);
-                wrap.appendChild(cb); wrap.appendChild(b);
+                target.parentNode.insertBefore(wrap, target);
+                wrap.appendChild(cb); wrap.appendChild(target);
+                // 布局全部交给 .pm-select-wrap 的 CSS：裸右侧气泡靠 margin-left:auto 贴右，
+                // 这里再设 inline flex:1 会把它撑满整行，反而贴不住右边。
                 wrap.dataset.side = side; wrap.dataset.text = b.dataset.text || '';
                 // 直接从气泡上读下标，渲染时已打好
                 const hi = b.dataset.historyIndex;
@@ -3677,12 +3830,18 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             });
         } else {
             trashBtn.style.color = ''; confirmBar.style.display = 'none';
-            list.querySelectorAll('.pm-select-wrap').forEach(wrap => {
-                const b = wrap.querySelector('.pm-bubble, .pm-group-bubble-wrap, .pm-director');
-                if (b) wrap.parentNode.insertBefore(b, wrap); wrap.remove();
-            });
+            list.querySelectorAll('.pm-select-wrap').forEach(pmUnwrapSelect);
         }
     };
+
+    // 把选择模式包的那层拆掉，还原被包进去的行/气泡。
+    // 包的可能是 .pm-row（开了头像）也可能是裸气泡，所以按第一个元素子节点取，
+    // 不能只查气泡类名 —— 查不到 .pm-row 会把整行连着气泡一起删掉。
+    function pmUnwrapSelect(wrap) {
+        const inner = [...wrap.children].find(c => !c.classList.contains('pm-custom-check'));
+        if (inner) wrap.parentNode.insertBefore(inner, wrap);
+        wrap.remove();
+    }
 
     window.__pmDeleteSelected = () => {
         const list = phoneWindow?.querySelector('.pm-msg-list'); if (!list) return;
@@ -3695,9 +3854,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
                 if (hi !== undefined && hi !== '') toRemoveIndices.add(Number(hi));
                 wrap.remove();
             } else {
-                const b = wrap.querySelector('.pm-bubble, .pm-group-bubble-wrap, .pm-director');
-                if (b) wrap.parentNode.insertBefore(b, wrap);
-                wrap.remove();
+                pmUnwrapSelect(wrap);
             }
         });
         if (toRemoveIndices.size > 0) {
@@ -3727,6 +3884,8 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             saveHistories();
         }
         if (phoneWindow) { try { phoneWindow.hidePopover?.(); } catch (e) {} phoneWindow.remove(); }
+        // 钉子必须在上面那次落盘之后才清：清早了 getStorageId() 会拿到新卡的 key
+        __pmPinnedStorageId = '';
         phoneWindow = null; phoneActive = false; isMinimized = false; isSelectMode = false;
         isGroupChat = false; groupMembers = []; groupColorMap = {}; groupDisplayName = ''; currentGroupKey = '';
         // 修复：关闭时重置冷启动标记，确保下次打开时（尤其是切换角色卡后）重新从 IDB 加载最新数据
@@ -3769,7 +3928,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         phoneWindow.setAttribute('data-theme', window.__pmTheme.darkMode || 'light');
         if (POPOVER_SUPPORTED) phoneWindow.setAttribute('popover', 'manual');
 
-        const editSvg = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+        const editSvg = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
 
         phoneWindow.innerHTML = `
 <div class="pm-island"></div>
@@ -3778,7 +3937,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     <div class="pm-nav-left">
       <button onclick="window.__pmShowList()" class="pm-nav-btn">☰</button>
       <button onclick="window.__pmShowWeibo()" class="pm-nav-btn" title="微博">🌐</button>
-      ${c?.groupId ? '' : '<button onclick="window.__pmShowMemo()" class="pm-nav-btn" title="备忘录">📖</button>'}
+      ${c?.groupId ? '' : '<button id="pm-memo-btn" onclick="window.__pmShowMemo()" class="pm-nav-btn" title="备忘录">📖</button>'}
     </div>
     <div class="pm-name-wrap">
       <div class="pm-name">${escapeHtml(defaultChar)}</div>
@@ -3804,6 +3963,8 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
 </div>`;
         document.body.appendChild(phoneWindow);
         if (phoneWindow.showPopover) try { phoneWindow.showPopover(); } catch (e) {}
+        // 先钉住再置 phoneActive：顺序反了的话 getStorageId() 会在钉子为空时返回实时值
+        __pmPinnedStorageId = computeStorageId();
         phoneActive = true;
         phoneWindow.querySelector('.pm-input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); window.__pmSend(); } });
         bindIsland(phoneWindow, phoneWindow.querySelector('.pm-island'));
@@ -3850,7 +4011,6 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     window.__pmWeiboIdentity = window.__pmWeiboIdentity || {};
     const PM_WB_MAX_POSTS = 30;      // 每桶最多 30 条，超出 FIFO 丢最旧
     const PM_WB_CTX_POSTS = 10;      // 喂给 AI 的自己最近博文数
-    const PM_WB_CTX_COMMENTS = 3;    // 喂给 AI 的带评论区的博文数
     let __pmWeiboLoaded = false;
     let __pmWeiboAcct = 'main';      // 当前账号，切换时不落盘（每次打开默认回大号）
     let __pmWeiboBusy = false;
@@ -3882,7 +4042,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     async function saveMemos() { await pmIDBSet('ST_SMS_MEMOS', window.__pmMemos).catch(() => {}); }
 
     function pmMemoList(create) {
-        const id = getStorageId();
+        const id = getPersonaStorageId();
         if (!window.__pmMemos) window.__pmMemos = {};
         if (!Array.isArray(window.__pmMemos[id])) {
             if (!create) return [];
@@ -4011,7 +4171,7 @@ ${isDiary ? `— 流水账、骂人、打油诗、顺口溜都行
         const list = pmMemoList(false);
         const recent = list.slice(-6).map(m => `[${m.type === 'diary' ? '日记' : '备忘'}][${m.when || '日期未知'}]${m.title}：${(m.text || '').slice(0, 60)}`).join('\n') || '（无）';
         const lastWhen = list.length ? (list[list.length - 1].when || '') : '';
-        const userPrompt = `【你扮演的角色】${charName}
+        const userPrompt = `【你扮演的角色】${charName}${pmPersonaNote(charName)}
 ${ctx.cardDesc}
 ${ctx.cardPersonality}
 ${ctx.cardScenario}
@@ -4071,9 +4231,11 @@ ${pmMemoSchema(type)}`;
         ].filter(g => g.items.length);
         const renderCard = m => `
       <div class="pm-memo-card" role="button" tabindex="0" onclick="window.__pmMemoOpen('${safeJS(m.id)}')">
-        <div class="pm-memo-card-title">${m.type === 'diary' ? '<span class="pm-memo-tag">日记</span>' : ''}${escapeHtml(m.title)}</div>
+        <div class="pm-memo-card-top">
+          <div class="pm-memo-card-title">${m.type === 'diary' ? '<span class="pm-memo-tag">日记</span>' : ''}${escapeHtml(m.title)}</div>
+          <span class="pm-memo-del" role="button" tabindex="0" onclick="event.stopPropagation();window.__pmMemoDel('${safeJS(m.id)}')">删除</span>
+        </div>
         <div class="pm-memo-card-sub"><span class="pm-memo-card-when">${escapeHtml(m.when || '')}</span>${m.when ? ' ' : ''}<span class="pm-memo-card-pre">${escapeHtml(pmMemoPreview(m.text))}</span></div>
-        <span class="pm-memo-del" role="button" tabindex="0" onclick="event.stopPropagation();window.__pmMemoDel('${safeJS(m.id)}')">删除</span>
       </div>`;
         const body = list.length
             ? groups.map(g => `${g.items.map(renderCard).join('')}`).join('<div class="pm-memo-group-sep"></div>')
@@ -4120,6 +4282,7 @@ ${pmMemoSchema(type)}`;
     };
 
     window.__pmMemoDel = async (id) => {
+        if (!confirm('确定要删除这条记录吗？')) return;
         const list = pmMemoList(false);
         const at = list.findIndex(m => m.id === id);
         if (at < 0) return;
@@ -4172,7 +4335,9 @@ ${pmMemoSchema(type)}`;
             '.pm-memo-card-when{color:#8e8e93;}',
             '.pm-memo-card-pre{color:#8e8e93;}',
             '.pm-memo-tag{display:inline-block;background:#ffcc00;color:#3a2e00;font-size:10px;font-weight:700;border-radius:4px;padding:1px 5px;margin-right:6px;vertical-align:1px;}',
-            '.pm-memo-del{font-size:12px;color:#c7c7cc;display:block;text-align:right;}',
+            '.pm-memo-card-top{display:flex;align-items:baseline;gap:8px;}',
+            '.pm-memo-card-top .pm-memo-card-title{flex:1;min-width:0;}',
+            '.pm-memo-del{font-size:12px;color:#c7c7cc;flex-shrink:0;padding:2px 4px;margin:-2px -4px -2px 0;}',
             '.pm-memo-del:active{color:#ff3b30;}',
             /* ── 底部按钮 ── */
             '.pm-memo-modal .pm-modal-add{background:#f2f2f7;border-top:none!important;}',
@@ -4203,8 +4368,11 @@ ${pmMemoSchema(type)}`;
     })();
 
     function wbIdentity(create, acct) {
-        const id = getStorageId();
+        const id = getPersonaStorageId();
         const a = acct || __pmWeiboAcct;
+        // __self / __groupRoster 是保留 key，形状不是身份记录（名册是数组）。
+        // 不挡住的话它们会被当身份返回，wbMigrateV 还会往数组上盖 vType。
+        if (String(a).startsWith('__')) return null;
         if (!window.__pmWeiboIdentity[id]) { if (!create) return null; window.__pmWeiboIdentity[id] = {}; }
         if (!window.__pmWeiboIdentity[id][a]) {
             if (!create) return null;
@@ -4228,14 +4396,14 @@ ${pmMemoSchema(type)}`;
     }
     // 指定账号的身份（不改当前 __pmWeiboAcct）—— 详情页要拿角色大号头像给「角色下场评论」用
     function wbIdentOf(acct) {
-        const id = getStorageId();
+        const id = getPersonaStorageId();
         const e = window.__pmWeiboIdentity[id]?.[acct];
         return e ? wbMigrateV(e) : null;
     }
     // 用户自己在微博上的身份（跨大小号共用——你在评论区始终是同一个人）
     // bio 为空就是默认的"普通网友"；填了就按填的来，网友和博主都会照这个身份对待你
     function wbSelf(create) {
-        const id = getStorageId();
+        const id = getPersonaStorageId();
         if (!window.__pmWeiboIdentity[id]) { if (!create) return null; window.__pmWeiboIdentity[id] = {}; }
         if (!window.__pmWeiboIdentity[id].__self) {
             if (!create) return null;
@@ -4243,6 +4411,79 @@ ${pmMemoSchema(type)}`;
         }
         return wbMigrateV(window.__pmWeiboIdentity[id].__self);
     }
+    // ── 群聊微博名册 ───────────────────────────────────────────────
+    // 名册快照：首次在群里打开微博时，把群成员列表克隆成微博专用名册。
+    // 此后群成员增删不再影响名册——群只起一次性播种作用。
+    // 存在 __pmWeiboIdentity[personaStorageId].__groupRoster = [member…]
+    function wbIsGroupWeibo() { return !!(isGroupChat && currentGroupKey); }
+
+    function wbRoster(create) {
+        const id = getPersonaStorageId();
+        if (!window.__pmWeiboIdentity[id]) {
+            if (!create) return null;
+            window.__pmWeiboIdentity[id] = {};
+        }
+        // 播种条件是 __groupRoster 不存在，不能用 wbPosts().length === 0 ——
+        // 否则删空博文会重新播种，把用户删掉的成员复活。
+        if (!Array.isArray(window.__pmWeiboIdentity[id].__groupRoster)) {
+            if (!create) return null;
+            const meta = window.__pmGroupMeta?.[getStorageId()]?.[currentGroupKey];
+            const names = (meta && Array.isArray(meta.members) && meta.members.length > 0)
+                ? meta.members.slice()
+                : ['角色'];           // 兜底：群元数据丢失时不播空数组
+            window.__pmWeiboIdentity[id].__groupRoster = names.map((n, i) => ({
+                id: `r_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+                realName: n, name: '', avatar: '', bio: '',
+                tier: 'auto', vType: i === 0 ? 'red' : '', fixedFans: false, fans: [], followed: false,
+            }));
+            saveWeiboIdentity();
+        }
+        return window.__pmWeiboIdentity[id].__groupRoster;
+    }
+
+    function wbRosterMember(id) {
+        const roster = wbRoster(false);
+        return roster ? (roster.find(m => m.id === id) || null) : null;
+    }
+
+    // 成员显示名（用户设的昵称优先，否则用真实角色名）
+    function wbMemberName(m) { return (m && (m.name || m.realName)) || ''; }
+
+    // 成员头像：先用名册里设置的，再回落到群聊里该成员的聊天头像
+    function wbMemberAvatar(m) {
+        if (!m) return '';
+        if (m.avatar) return m.avatar;
+        // getAvatarKey() 在群聊里返回 currentGroupKey，getAvatarEntry 已经是群正确的
+        const entry = getAvatarEntry(false);
+        return entry?.members?.[m.realName] || '';
+    }
+
+    // 根据博文解析作者身份：群聊大号且有 author 字段时取名册成员，否则走原有路径
+    function wbAuthorIdent(post, acct) {
+        const a = acct || __pmWeiboAcct;
+        if (wbIsGroupWeibo() && a === 'main' && post && post.author) {
+            const m = wbRosterMember(post.author);
+            if (m) return m;
+            // 作者已被删除：返回占位对象而不是 null，让渲染能继续
+            return { id: post.author, realName: '已注销', name: '已注销', avatar: '',
+                     vType: '', tier: 'auto', fixedFans: false, fans: [], followed: false };
+        }
+        return wbCurIdent(false, a) || {};
+    }
+
+    // 名册成员和账号身份的头像/昵称取法不同（成员要回落群聊头像、显示名要回落真实角色名），
+    // 靠 realName 字段区分：只有名册成员有这个字段
+    function wbIdentAvatar(ident, acct) {
+        if (ident && ident.realName !== undefined) return wbMemberAvatar(ident);
+        return wbAvatarFor(acct || __pmWeiboAcct);
+    }
+    function wbIdentName(ident, acct) {
+        if (ident && ident.realName !== undefined) return wbMemberName(ident);
+        return wbDefaultName(acct || __pmWeiboAcct);
+    }
+
+    // ── 名册基础设施结束 ───────────────────────────────────────────
+
     function wbSelfName() {
         const s = wbSelf(false);
         return (s && s.name) || getUserPersona().name || '我';
@@ -4272,8 +4513,8 @@ ${pmMemoSchema(type)}`;
     const PM_WB_TIERS = {
         auto:     { label: '自动（AI按角色卡判断）', hint: '' },
         top:      { label: '顶流明星', hint: '点赞 100万-200万，评论 10万-80万（绝对不要超过 100万），转发数万' },
-        mid:      { label: '中等明星', hint: '点赞 10万-50万，评论数千到上万，转发数千' },
-        small:    { label: '小明星 / 运动员 / 电竞选手', hint: '点赞 5万-10万，评论数千，转发上千' },
+        mid:      { label: '二线明星', hint: '点赞 10万-50万，评论数千到上万，转发数千' },
+        small:    { label: '小明星', hint: '点赞 5万-10万，评论数千，转发上千' },
         pro:      { label: '不火（业内有建树，如高管、名医）', hint: '点赞 1万-5万，评论几百条，转发几十到几百' },
         ordinary: { label: '素人（普通上班族、学生等）', hint: '点赞 10-200，评论几条到几十条，转发个位数' },
     };
@@ -4284,7 +4525,7 @@ ${pmMemoSchema(type)}`;
     }
     // acct 显式传入时锁定那个桶：异步生成期间用户切 tab 也不会写错账号
     function wbPosts(create, acct) {
-        const id = getStorageId();
+        const id = getPersonaStorageId();
         const a = acct || __pmWeiboAcct;
         if (!window.__pmWeiboPosts[id]) { if (!create) return []; window.__pmWeiboPosts[id] = {}; }
         if (!Array.isArray(window.__pmWeiboPosts[id][a])) {
@@ -4307,8 +4548,21 @@ ${pmMemoSchema(type)}`;
         return wbCharName() + (a === 'alt' ? '的小号' : '');
     }
     function wbCharName() {
+        // 多人卡优先用当前联系人名，没联系人时退回角色卡名
+        if (!isGroupChat && currentPersona) return currentPersona;
         const c = getCtx();
         return c?.characters?.[c.characterId]?.name || '角色';
+    }
+    // 多人卡里卡名常常是作品名（如「某某同人」），而联系人才是真正要扮演的人。
+    // 名字和卡名不一致时，明确告诉 AI 以联系人为准，否则它会照卡名那个身份写。
+    function pmCardName() {
+        const c = getCtx();
+        return c?.characters?.[c.characterId]?.name || '';
+    }
+    function pmPersonaNote(name) {
+        const card = pmCardName();
+        if (!card || !name || card === name) return '';
+        return `\n（注意：下面的设定是一张包含多个角色的卡「${card}」，卡名不是人名。你现在只扮演其中的「${name}」，用 TA 的身份和口吻写，不要代入卡里的其他角色。）`;
     }
     // 头像兜底：聊天页设过头像的话，大号沿用角色那张、我的沿用用户那张（小号是马甲，不兜底）
     function wbAvatarFor(acct) {
@@ -4337,23 +4591,28 @@ ${pmMemoSchema(type)}`;
         const ident = wbIdentity(false, a) || {};
         const posts = wbPosts(false, a);
         const recent = posts.slice(-PM_WB_CTX_POSTS);
+        // 群聊大号是合并时间线，每行要标出作者，AI 才知道哪条是谁发的
+        const groupFeed = wbIsGroupWeibo() && a === 'main';
         const historyText = recent.length
-            ? recent.map(p => `- ${p.text}`).join('\n')
-            : '（还没发过微博）';
-        const withComments = posts.slice(-PM_WB_CTX_COMMENTS).filter(p => (p.comments || []).length);
-        const commentText = withComments.length
-            ? withComments.map(p => {
-                const cs = (p.comments || []).map(c => {
-                    const subs = (c.replies || []).map(r => `    · ${r.name}：${r.text}`).join('\n');
-                    return `  · ${c.name}：${c.text}${subs ? '\n' + subs : ''}`;
-                }).join('\n');
-                return `【博文】${p.text.slice(0, 60)}\n${cs}`;
+            ? recent.map(p => {
+                if (!groupFeed) return `- ${p.text}`;
+                const m = p.author ? wbRosterMember(p.author) : null;
+                return `- [${m ? wbMemberName(m) : '未知'}]${p.text}`;
             }).join('\n')
-            : '（暂无历史评论）';
+            : '（还没发过微博）';
+        // acctLabel 拆成两半：acctLabel 只说账号是什么（两个 prompt 都要），
+        // acctPostNote 是"怎么写正文"（只有发博用），acctCommentNote 是"评论区怎么对待 TA"（只有收评论用）。
+        // 原来三件事挤在一个 180 字的块里，收评论时"平等交流不要追捧崇拜"被埋在一堆发博要求中间。
         const acctLabel = a === 'main'
-            ? '大号（角色的公开账号，说话要顾及公众形象。昵称可以是个网名而不是真名，但公众都知道这个号就是本人 —— 评论区网友清楚在跟谁说话，可以直呼其名、提 TA 的作品/身份/近况，不需要遮掩）'
-            : '小号（角色的私密马甲，绝对不要暴露真实身份。内容要大众化生活化——聊聊天气、吃的、路上见闻、吐槽日常琐事、追剧感想之类，人人都可能发的东西。绝对不要提亲朋好友的名字或身份、不要炫富晒奢侈品、不要发工作内幕、不要发任何能让人猜到"这是个名人"的内容。语气随意放松，像个普通素人。评论区网友也只把 TA 当普通路人对待，平等交流，不要追捧崇拜）——如果角色本身就是素人/普通人，小号没有额外的隐藏要求';
-        return { ctx, ident, acctLabel, historyText, commentText };
+            ? '大号（角色的公开账号，公众都知道这个号就是本人）'
+            : '小号（角色的私密马甲，不能暴露真实身份）';
+        const acctPostNote = a === 'main'
+            ? '说话要顾及公众形象。昵称可以是个网名而不是真名，但公众都知道这个号就是本人。'
+            : '内容要大众化生活化——聊聊天气、吃的、路上见闻、吐槽日常琐事、追剧感想之类，人人都可能发的东西。绝对不要提亲朋好友的名字或身份、不要炫富晒奢侈品、不要发工作内幕、不要发任何能让人猜到"这是个名人"的内容。语气随意放松，像个普通素人。如果角色本身就是素人/普通人，小号没有额外的隐藏要求。';
+        const acctCommentNote = a === 'main'
+            ? '评论区网友清楚在跟谁说话，可以直呼其名、提 TA 的作品/身份/近况，不需要遮掩。'
+            : '评论区网友不知道这是谁，只把 TA 当普通路人对待——平等交流，不要追捧崇拜，也不要说出任何能点破真实身份的话。';
+        return { ctx, ident, acctLabel, acctPostNote, acctCommentNote, historyText };
     }
 
     function wbSystemPrompt() {
@@ -4371,8 +4630,9 @@ ${pmMemoSchema(type)}`;
 
     // needName：账号还没有昵称时，让 AI 顺手起一个。
     // 小号要藏身份（昵称不能沾真名），大号是公开号（昵称反而最好和本名有关联）—— 所以要知道是哪个号
-    function wbPostSchema(needName, acct) {
+    function wbPostSchema(needName, acct, count) {
         const isMain = acct === 'main';
+        const n = Math.max(1, Math.min(3, Number(count) || 3));
         return `输出 JSON 结构：
 {
 ${needName ? `  "author_name": "这个${isMain ? '账号' : '小号'}的昵称，10 字以内",\n` : ''}  "posts": [
@@ -4392,7 +4652,7 @@ ${needName ? `  "author_name": "这个${isMain ? '账号' : '小号'}的昵称�
     }
   ]
 }
-posts 必须正好 3 条，按时间从旧到新排列，内容互不重复（可以是不同话题，也可以是同一件事的不同阶段）。
+posts 必须正好 ${n} 条，按时间从旧到新排列，内容互不重复（可以是不同话题，也可以是同一件事的不同阶段）。
 每条微博的 comments 给 10-14 条主评论，热评在前，其中 3-5 条带 replies 楼中楼（每条楼中楼最多 2 层回复）。
 
 【篇幅硬性限制】必须遵守，超长会被截断：
@@ -4476,9 +4736,10 @@ vip 为 true 表示昵称显示橙色会员色。${needName ? (isMain ? `
         return `以下是该账号的固定粉丝，本次评论请优先复用这些昵称（可只用其中一部分，也可新增 1-2 个新面孔）：\n${pool.map(f => f.name).join('、')}`;
     }
     // 固定网友：把本次出现过的昵称并入粉丝池，后续生成复用
-    function wbAbsorbFans(post, acct) {
-        const ident = wbIdentity(true, acct);
-        if (!ident.fixedFans) return;
+    // 收身份对象而不是账号名：群聊里粉丝池挂在名册成员上，传账号名会写错记录
+    function wbAbsorbFans(post, ident) {
+        if (!ident || !ident.fixedFans) return;
+        if (!Array.isArray(ident.fans)) ident.fans = [];
         const seen = new Set((ident.fans || []).map(f => f.name));
         const add = (name, vip) => { if (name && !seen.has(name)) { seen.add(name); ident.fans.push({ name, vip: !!vip }); } };
         (post.comments || []).forEach(c => { add(c.name, c.vip); (c.replies || []).forEach(r => add(r.name, false)); });
@@ -4486,13 +4747,22 @@ vip 为 true 表示昵称显示橙色会员色。${needName ? (isMain ? `
     }
 
     // 刷新：AI 以角色身份生成 3 条新微博，每条自带完整评论区
-    async function wbGeneratePosts(acct) {
+    // opts.member：群聊时传名册成员，身份/粉丝池/昵称写回都走这个成员而不是账号记录
+    // opts.count：这次生成几条（群聊按分配的点数，单人固定 3）
+    async function wbGeneratePosts(acct, opts) {
         const lockAcct = acct || __pmWeiboAcct;
-        const { ctx, ident, acctLabel, historyText, commentText } = await wbBuildContext(lockAcct);
+        const member = opts?.member || null;
+        const count = Math.max(1, Math.min(3, Number(opts?.count) || 3));
+        const { ctx, acctLabel, acctPostNote, acctCommentNote, historyText } = await wbBuildContext(lockAcct);
+        // 群聊时身份取成员，单人取账号
+        const ident = member || wbIdentity(false, lockAcct) || {};
         // 大号/小号没昵称：这次生成顺便让 AI 起名（小号要藏身份，大号要和本名有关联，分工在 wbPostSchema 里）。
         // 「我的号」是用户自己的账号，昵称跟着用户名走，不让 AI 起
-        const needName = (lockAcct === 'alt' || lockAcct === 'main') && !(ident && ident.name);
-        const userPrompt = `【角色卡】
+        const needName = (member || lockAcct === 'alt' || lockAcct === 'main') && !(ident && ident.name);
+        // 群聊里 wbCharName() 返回的是卡名，成员身份要单独给
+        const charName = member ? (member.realName || wbMemberName(member)) : wbCharName();
+        const displayName = member ? wbMemberName(member) : wbDefaultName(lockAcct);
+        const userPrompt = `【角色卡】${pmPersonaNote(charName)}
 ${ctx.cardDesc}
 ${ctx.cardPersonality}
 ${ctx.cardScenario}
@@ -4504,10 +4774,16 @@ ${ctx.worldBookText || '（无）'}
 ${ctx.mainChatText || '（无）'}
 
 【用户角色】${ctx.userName}：${ctx.userDesc || '（无设定）'}
-
-【发博账号】${acctLabel}
-昵称：${needName ? `（还没起，见文末 author_name 要求${lockAcct === 'main' ? `。本名是「${wbCharName()}」，起名要和它有关联` : ''}）` : wbDefaultName(lockAcct)}
+${member ? `
+【你现在扮演谁】这是一个群聊场景，你只扮演其中的「${charName}」发微博，不要代入群里的其他角色。
+` : ''}
+【发博账号】${member ? `${charName} 的微博号（公开号，公众知道这个号就是本人）` : acctLabel}
+${member ? '写正文时要顾及公众形象。' : acctPostNote}
+昵称：${needName ? `（还没起，见文末 author_name 要求。本名是「${charName}」，起名要和它有关联）` : displayName}
 账号设定：${ident.bio || '（未填写，请根据角色卡自行推断这个账号的调性）'}
+
+【评论区怎么对待这个账号】
+${member ? '评论区网友清楚在跟谁说话，可以直呼其名、提 TA 的身份和近况。' : acctCommentNote}
 
 【名气档位】
 ${wbTierHint(ident)}
@@ -4515,19 +4791,17 @@ ${wbTierHint(ident)}
 【该账号最近的微博】
 ${historyText}
 
-【该账号最近博文的评论区】
-${commentText}
-
 【固定网友规则】
 ${wbFansPrompt(ident)}
 
-请以角色本人的身份，生成 3 条新的微博（含各自完整的评论区）。这 3 条要符合角色当前的处境和心情，和上面列出的历史微博不要重复。
-${wbPostSchema(needName, lockAcct)}`;
-        const raw = await callAI(wbSystemPrompt(), userPrompt, { maxTokens: 3200 });
+请以${member ? `「${charName}」` : '角色'}本人的身份，生成 ${count} 条新的微博（含各自完整的评论区）。这 ${count} 条要符合角色当前的处境和心情，和上面列出的历史微博不要重复。
+${wbPostSchema(needName, lockAcct, count)}`;
+        // maxTokens 按条数缩放：3200 是按 3 条带完整评论区估的
+        const raw = await callAI(wbSystemPrompt(), userPrompt, { maxTokens: count >= 3 ? 3200 : (count === 2 ? 2300 : 1400) });
         const o = wbParseJSON(raw);
         // 用户自己填过昵称就永远不覆盖；只有 needName 那次才写回
         if (needName && o.author_name) {
-            const target = wbIdentity(true, lockAcct);
+            const target = member || wbIdentity(true, lockAcct);
             if (target && !target.name) {
                 target.name = String(o.author_name).trim().slice(0, 10);
                 await saveWeiboIdentity();
@@ -4535,14 +4809,23 @@ ${wbPostSchema(needName, lockAcct)}`;
         }
         const arr = Array.isArray(o.posts) ? o.posts : (o.text ? [o] : []);
         if (!arr.length) throw new Error('AI 没有返回任何微博');
-        return arr.slice(0, 3).map(x => wbNormalizePost(x));
+        return arr.slice(0, count).map(x => {
+            const p = wbNormalizePost(x);
+            if (member) p.author = member.id;   // 合并时间线靠这个字段认作者
+            return p;
+        });
     }
 
     // 刷新：只针对用户新发的评论/回复生成回应，但允许其他网友"串戏"插话
     // acct 显式传入时锁定那个桶：等待期间用户切 tab 也不会把粉丝写错账号
     async function wbRefreshComments(post, acct) {
         const lockAcct = acct || __pmWeiboAcct;
-        const { ctx, ident, acctLabel } = await wbBuildContext(lockAcct);
+        const { ctx, ident: acctIdent, acctLabel, acctCommentNote } = await wbBuildContext(lockAcct);
+        // 群聊是合并时间线：评论区里下场回复的是「这条博文的作者」，不是共享的大号账号。
+        // 昵称/简介/固定网友都要跟着博文作者走，否则甲的博文下会由大号昵称回复。
+        const authorIdent = wbAuthorIdent(post, lockAcct);
+        const ident = (authorIdent && authorIdent.realName !== undefined) ? authorIdent : acctIdent;
+        const ownerName = wbIdentName(ident, lockAcct);
         const pending = [];
         const me = wbSelfName();
         (post.comments || []).forEach(c => {
@@ -4571,8 +4854,9 @@ ${ctx.worldBookText || '（无）'}
 【主线剧情最近对话】
 ${ctx.mainChatText || '（无）'}
 
-【发博账号】${acctLabel}，昵称：${wbDefaultName(lockAcct)}
+【发博账号】${acctLabel}，昵称：${ownerName}
 账号设定：${ident.bio || '（无）'}
+【评论区怎么对待这个账号】${acctCommentNote}
 
 【用户在微博上的身份】昵称「${me}」：${wbSelfIdentityText()}
 网友和博主都按这个身份看待用户——如果用户是个有身份的人，评论区该认出来就认出来（起哄、质疑、蹭热度都行）；如果只是普通网友，就当普通人对待。
@@ -4591,7 +4875,7 @@ ${wbFansPrompt(ident)}
 
 要求：
 1. 主要针对上面"需要回应的新动作"生成回应。
-2. 博主（角色本人）也可能亲自下场回复用户——如果角色的性格和当前处境让他愿意回，就在 replies_to_comments 里用博主的昵称「${wbDefaultName(lockAcct)}」回一条，并把 by_owner 设为 true。不是每次都要回，看角色愿不愿意。
+2. 博主（角色本人）也可能亲自下场回复用户——如果角色的性格和当前处境让他愿意回，就在 replies_to_comments 里用博主的昵称「${ownerName}」回一条，并把 by_owner 设为 true。不是每次都要回，看角色愿不愿意。
 3. 允许串戏：如果有别的网友对这个话题感兴趣，也可以让他插一条回复进来，不必只回应被 @ 的那个人。
 4. 回复要接住上下文，像真人在评论区你来我往，可以调侃、追问、反驳。
 5. 只输出新增的内容，不要重复已有评论。
@@ -4640,7 +4924,9 @@ ${wbFansPrompt(ident)}
             if (c.isSelf) c.answered = true;
             (c.replies || []).forEach(r => { if (r.isSelf) r.answered = true; });
         });
-        wbAbsorbFans(post, lockAcct);
+        // 固定网友要写进活的记录才落盘：账号侧得用 create=true 重取（wbBuildContext 用的是
+        // create=false，没记录时给的是临时 {}），名册成员本身就是活对象，直接写。
+        wbAbsorbFans(post, ident === acctIdent ? wbIdentity(true, lockAcct) : ident);
         return { added };
     }
 
@@ -4660,8 +4946,10 @@ ${wbFansPrompt(ident)}
         setTimeout(() => t.remove(), 2200);
     }
 
-    // 覆盖层挂在 body 上而非 #pm-iphone 内，拿不到 data-theme 继承，所以显式打 is-dark
-    function wbDarkCls() { return (window.__pmTheme?.darkMode === 'dark') ? ' is-dark' : ''; }
+    // 微博始终走白底：深色底下正文/评论对比度太低看不清。
+    // 保留这个函数而不是删掉六处调用点 —— 只在这里返回空串，下面那些 .wb-modal.is-dark /
+    // .pm-modal.is-dark 规则就整批失效，将来想恢复只要把判断写回来。
+    function wbDarkCls() { return ''; }
 
     // ── 图标：路径直接取自 微博生成器3.0.html，保持同一套视觉语言 ──────
     const WB_PATH_REPOST = 'M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z';
@@ -4725,17 +5013,29 @@ ${wbFansPrompt(ident)}
         if (!__pmWeiboLoaded) {
             loadWeiboData().then(() => { if (document.querySelector('#pm-overlay .wb-feed')) window.__pmShowWeibo(); });
         }
-        const ident = wbCurIdent(false) || {};
+        // 步骤5：alt 泄漏守卫——在任何路径进来前重置
+        const isGrp = wbIsGroupWeibo();
+        if (isGrp) {
+            if (__pmWeiboAcct === 'alt') __pmWeiboAcct = 'main';
+            // 群聊首次打开时播种名册
+            wbRoster(true);
+        }
         const posts = wbPosts(false).slice().reverse();
-        const name = wbDefaultName();
         const me = wbIsMe();
+        // 群聊大号的"默认空状态"名字用群名；单人用原有逻辑
+        const emptyName = isGrp && !me ? (window.__pmGroupMeta?.[getStorageId()]?.[currentGroupKey]?.name || '群聊') : wbDefaultName();
 
-        // 列表页只给正文 + 转赞评数量，配图和评论区都留到详情页（像微博页面中间被截掉）
-        const cards = posts.map(p => `<div class="wb-card" onclick="window.__pmWeiboDetail('${safeJS(p.id)}')">
+        // 卡片：身份查询移进循环，支持合并时间线
+        const cards = posts.map(p => {
+            const aIdent = wbAuthorIdent(p, __pmWeiboAcct);
+            const aAvatar = wbIdentAvatar(aIdent, __pmWeiboAcct);
+            const aName = wbIdentName(aIdent, __pmWeiboAcct);
+            const aVType = aIdent.vType || '';
+            return `<div class="wb-card" onclick="window.__pmWeiboDetail('${safeJS(p.id)}')">
   <div class="wb-card-top">
-    ${wbAvatarHtml(wbAvatarFor(__pmWeiboAcct), 'wb-av-40', ident.vType)}
+    ${wbAvatarHtml(aAvatar, 'wb-av-40', aVType)}
     <div class="wb-card-id">
-      <div class="wb-uname${wbNameCls(ident.vType)}"><span>${escapeHtml(name)}</span></div>
+      <div class="wb-uname${wbNameCls(aVType)}"><span>${escapeHtml(aName)}</span></div>
       <div class="wb-meta">${escapeHtml(p.time)}${p.ip ? ' · 发布于 ' + escapeHtml(p.ip) : ''}</div>
     </div>
   </div>
@@ -4746,7 +5046,8 @@ ${wbFansPrompt(ident)}
     <span>${wbIcon(WB_PATH_COMMENT, 14)}<b>${wbNum(p.commentsCount)}</b></span>
     <span class="wb-like ${p.liked ? 'is-liked' : ''}" onclick="event.stopPropagation();window.__pmWeiboLikeFeed(this,'${safeJS(p.id)}')" role="button" tabindex="0" title="${p.liked ? '取消赞' : '赞'}">${wbLikeIcon(!!p.liked, 14)}<b>${wbLikeLabel(p.likes, !!p.liked)}</b></span>
   </div>
-</div>`).join('');
+</div>`;
+        }).join('');
 
         makeOverlay(`
 <div class="pm-modal pm-modal-wide wb-modal${wbDarkCls()}">
@@ -4759,23 +5060,23 @@ ${wbFansPrompt(ident)}
   </div>
   <div class="wb-acct-tabs">
     <div class="wb-tab ${__pmWeiboAcct === 'main' ? 'is-on' : ''}" onclick="window.__pmWeiboSetAcct('main')" role="button" tabindex="0">大号</div>
-    <div class="wb-tab ${__pmWeiboAcct === 'alt' ? 'is-on' : ''}" onclick="window.__pmWeiboSetAcct('alt')" role="button" tabindex="0">小号</div>
+    ${isGrp ? '' : `<div class="wb-tab ${__pmWeiboAcct === 'alt' ? 'is-on' : ''}" onclick="window.__pmWeiboSetAcct('alt')" role="button" tabindex="0">小号</div>`}
     <div class="wb-tab ${me ? 'is-on' : ''}" onclick="window.__pmWeiboSetAcct('me')" role="button" tabindex="0">我的</div>
   </div>
   <div class="pm-modal-scroll wb-feed">
     ${posts.length ? cards : (!__pmWeiboLoaded ? wbSkeletonHtml() : `<div class="wb-empty">
       <div class="wb-empty-ic">${me ? '✍️' : '🌐'}</div>
-      <div class="wb-empty-t">${me ? '你还没发过微博' : escapeHtml(name) + '的' + (__pmWeiboAcct === 'main' ? '大号' : '小号') + '还没有微博'}</div>
+      <div class="wb-empty-t">${me ? '你还没发过微博' : escapeHtml(emptyName) + '还没有微博'}</div>
       <div class="wb-empty-s">${me
                 ? '点下面的发微博写一条<br>发完点 🔄 让网友来评论'
-                : '点下面的刷新，让 TA 发三条<br>先去 ⚙️ 里设好头像、昵称和名气档位，生成的内容会更贴角色'}</div>
+                : (isGrp ? '点下面的按钮分配点数，让群成员各自发微博' : '点下面的刷新，让 TA 发三条<br>先去 ⚙️ 里设好头像、昵称和名气档位，生成的内容会更贴角色')}</div>
     </div>`)}
   </div>
   <div class="pm-modal-add">
     ${me ? `
     <button onclick="window.__pmWeiboCompose()" class="wb-btn-main" style="flex:1;">✍️ 发微博</button>
     <button id="pm-wb-refresh-btn" onclick="window.__pmWeiboReplyMine()" class="wb-btn-sub" title="让网友来评论你还没有人回复的微博">🔄 收评论</button>`
-                : `<button id="pm-wb-refresh-btn" onclick="window.__pmWeiboRefreshFeed()" class="wb-btn-main" style="flex:1;">🔄 刷新（生成3条新微博）</button>`}
+                : `<button id="pm-wb-refresh-btn" onclick="window.__pmWeiboRefreshFeed()" class="wb-btn-main" style="flex:1;">${isGrp ? '✦ 分配点数生成' : '🔄 刷新（生成3条新微博）'}</button>`}
   </div>
 </div>`);
     };
@@ -4828,8 +5129,23 @@ function wbGridHtml(images, clip, pid) {
         return one('96%', '61%') + one('88%', '73%') + one('93%', '45%');
     }
 
-    // 刷新动态：生成 3 条新博文，只作用于当前正在看的账号
+    // 刷新动态：单人直接生成 3 条；群聊先弹点数分配面板
     window.__pmWeiboRefreshFeed = async () => {
+        // busy 检查必须在开弹窗之前，否则生成中还能叠第二个分配面板
+        if (__pmWeiboBusy) return;
+        if (wbIsGroupWeibo() && __pmWeiboAcct === 'main') {
+            const roster = wbRoster(true) || [];
+            if (!roster.length) { wbToast('名册为空，先去 ⚙️ 里添加成员'); return; }
+            // 只有一个成员就跳过弹窗，3 条全给 TA（和单人行为一致）
+            if (roster.length === 1) { wbRunGroupGen([{ member: roster[0], count: 3 }]); return; }
+            wbShowAllocDialog(roster);
+            return;
+        }
+        wbRunSingleGen();
+    };
+
+    // 单人模式（以及群聊的「我的」页）：原有行为，一次生成 3 条
+    async function wbRunSingleGen() {
         if (__pmWeiboBusy) return;
         __pmWeiboBusy = true;
         const btn = document.getElementById('pm-wb-refresh-btn');
@@ -4841,40 +5157,178 @@ function wbGridHtml(images, clip, pid) {
         try {
             const posts = await wbGeneratePosts(lockAcct);
             const arr = wbPosts(true, lockAcct);
-            posts.forEach(p => { arr.push(p); wbAbsorbFans(p, lockAcct); });
+            const acctIdent = wbIdentity(true, lockAcct);
+            posts.forEach(p => { arr.push(p); wbAbsorbFans(p, acctIdent); });
             while (arr.length > PM_WB_MAX_POSTS) arr.shift();
             await Promise.all([saveWeiboPosts(), saveWeiboIdentity()]);
-            window.__pmShowWeibo();
+            // 只在微博 feed 仍在前台时才刷新界面，避免顶掉备忘录等其他界面
+            if (document.querySelector('#pm-overlay .wb-feed')) {
+                window.__pmShowWeibo();
+            }
             wbToast(`生成了 ${posts.length} 条新微博`);
         } catch (e) {
             document.getElementById('pm-wb-skel')?.remove();
             if (btn) { btn.textContent = '🔄 刷新（生成3条新微博）'; btn.disabled = false; btn.style.opacity = '1'; }
             wbToast('生成失败：' + (e.message || e));
         } finally { __pmWeiboBusy = false; }
+    }
+
+    // 点数分配面板。必须用 pmSubOverlay：makeOverlay 会把 feed 拆掉，
+    // 之后 wbRunGroupGen 就找不到 .wb-feed，骨架和最终重绘全都失效
+    const PM_WB_POINTS = 3;
+    function wbShowAllocDialog(roster) {
+        const rows = roster.map((m, i) => `
+  <div class="wb-alloc-row">
+    <span class="wb-alloc-name">${escapeHtml(wbMemberName(m))}</span>
+    <div class="wb-alloc-ctl">
+      <button class="wb-alloc-btn" onclick="window.__pmWbAllocStep(${i},-1)">−</button>
+      <span class="wb-alloc-n" id="pm-wb-alloc-${i}">0</span>
+      <button class="wb-alloc-btn" onclick="window.__pmWbAllocStep(${i},1)">＋</button>
+    </div>
+  </div>`).join('');
+        __pmWbAlloc = roster.map(() => 0);
+        pmSubOverlay(`
+<div class="pm-modal pm-modal-wide wb-modal${wbDarkCls()}">
+  <div class="pm-modal-header">
+    <b>分配生成点数</b>
+    <span onclick="document.getElementById('pm-overlay-sub')?.remove()" class="pm-modal-close">✕</span>
+  </div>
+  <div class="pm-modal-scroll" style="padding:12px 14px;">
+    <div class="wb-form-note" style="margin-bottom:10px;">共 ${PM_WB_POINTS} 点，剩余 <b id="pm-wb-alloc-left">${PM_WB_POINTS}</b> 点。</div>
+    ${rows}
+  </div>
+  <div class="pm-modal-add">
+    <button id="pm-wb-alloc-go" onclick="window.__pmWbAllocConfirm()" style="width:100%;background:var(--wb-orange,#ff8200);color:#fff;border:none;border-radius:10px;padding:10px;font-size:13px;cursor:pointer;font-weight:600;opacity:.5;" disabled>开始生成</button>
+  </div>
+</div>`);
+    }
+
+    let __pmWbAlloc = [];
+    window.__pmWbAllocStep = (i, d) => {
+        const used = __pmWbAlloc.reduce((a, b) => a + b, 0);
+        const next = __pmWbAlloc[i] + d;
+        if (next < 0 || next > PM_WB_POINTS) return;
+        if (d > 0 && used >= PM_WB_POINTS) return;
+        __pmWbAlloc[i] = next;
+        const cell = document.getElementById(`pm-wb-alloc-${i}`);
+        if (cell) cell.textContent = String(next);
+        const left = PM_WB_POINTS - __pmWbAlloc.reduce((a, b) => a + b, 0);
+        const leftEl = document.getElementById('pm-wb-alloc-left');
+        if (leftEl) leftEl.textContent = String(left);
+        const go = document.getElementById('pm-wb-alloc-go');
+        const any = __pmWbAlloc.some(n => n > 0);
+        if (go) { go.disabled = !any; go.style.opacity = any ? '1' : '.5'; }
     };
 
-    window.__pmWeiboSetAcct = (a) => { __pmWeiboAcct = a; window.__pmShowWeibo(); };
+    window.__pmWbAllocConfirm = () => {
+        const roster = wbRoster(false) || [];
+        const plan = __pmWbAlloc
+            .map((count, i) => ({ member: roster[i], count }))
+            .filter(x => x.member && x.count > 0);
+        if (!plan.length) return;
+        // 先拆掉 sub-overlay 再开始生成，这样下面才找得到活着的 feed
+        document.getElementById('pm-overlay-sub')?.remove();
+        wbRunGroupGen(plan);
+    };
+
+    // 按成员串行生成。每个成员生成完就落盘 —— 第 3 个失败不能让前两个的博文丢掉
+    async function wbRunGroupGen(plan) {
+        if (__pmWeiboBusy) return;
+        __pmWeiboBusy = true;
+        const btn = document.getElementById('pm-wb-refresh-btn');
+        const feed = document.querySelector('#pm-overlay .wb-feed');
+        if (feed) { feed.insertAdjacentHTML('afterbegin', `<div id="pm-wb-skel">${wbSkeletonHtml()}</div>`); feed.scrollTop = 0; }
+        if (btn) { btn.disabled = true; btn.style.opacity = '.6'; }
+        const total = plan.reduce((a, x) => a + x.count, 0);
+        let done = 0, made = 0;
+        const errors = [];
+        try {
+            for (const { member, count } of plan) {
+                if (btn) btn.textContent = `生成中… ${wbMemberName(member)}（${done}/${total}）`;
+                try {
+                    const posts = await wbGeneratePosts('main', { member, count });
+                    const arr = wbPosts(true, 'main');
+                    posts.forEach(p => { arr.push(p); wbAbsorbFans(p, member); });
+                    while (arr.length > PM_WB_MAX_POSTS) arr.shift();
+                    // 每个成员单独落盘，中途失败也不丢前面的
+                    await Promise.all([saveWeiboPosts(), saveWeiboIdentity()]);
+                    made += posts.length;
+                } catch (e) {
+                    errors.push(`${wbMemberName(member)}：${e.message || e}`);
+                }
+                done += count;
+            }
+            if (document.querySelector('#pm-overlay .wb-feed')) window.__pmShowWeibo();
+            if (made && errors.length) wbToast(`生成了 ${made} 条，${errors.length} 个成员失败`);
+            else if (made) wbToast(`生成了 ${made} 条新微博`);
+            else wbToast('生成失败：' + (errors[0] || '未知错误'));
+        } catch (e) {
+            // 兜底：整体异常时也要把已生成的画出来
+            document.getElementById('pm-wb-skel')?.remove();
+            if (document.querySelector('#pm-overlay .wb-feed')) window.__pmShowWeibo();
+            wbToast('生成失败：' + (e.message || e));
+        } finally { __pmWeiboBusy = false; }
+    }
+
+    window.__pmWeiboSetAcct = (a) => {
+        // 群聊没有小号：挡掉传 alt 的情况，防止在群桶里凭空创建一个小号身份
+        if (a === 'alt' && wbIsGroupWeibo()) a = 'main';
+        __pmWeiboAcct = a; window.__pmShowWeibo();
+    };
 
     // 每个 tab 的齿轮只编辑自己那一个身份：大号编大号、小号编小号、我的编用户自己
-    window.__pmWeiboIdentityModal = () => {
+    // 群聊大号模式下显示成员下拉框，可切换编辑各成员
+    window.__pmWeiboIdentityModal = (memberOverrideId) => {
         const me = wbIsMe();
-        const ident = wbCurIdent(true);
-        const label = me ? '我的账号' : (__pmWeiboAcct === 'main' ? '大号' : '小号');
+        const grpMain = !me && wbIsGroupWeibo() && __pmWeiboAcct === 'main';
+
+        // 确定当前要编辑的身份
+        let ident, stampedId, label;
+        if (grpMain) {
+            const roster = wbRoster(true) || [];
+            const m = (memberOverrideId ? roster.find(r => r.id === memberOverrideId) : null) || roster[0];
+            if (!m) { wbToast('名册为空'); return; }
+            ident = m;
+            stampedId = m.id;
+            label = '成员设置';
+        } else {
+            ident = wbCurIdent(true) || {};
+            stampedId = '';
+            label = me ? '我的账号' : (__pmWeiboAcct === 'main' ? '大号' : '小号');
+        }
+
         const vOpts = Object.keys(PM_WB_VTYPES).map(k =>
             `<option value="${k}"${(ident.vType || '') === k ? ' selected' : ''}>${escapeHtml(PM_WB_VTYPES[k])}</option>`).join('');
         const tierOpts = Object.keys(PM_WB_TIERS).map(k =>
             `<option value="${k}"${(ident.tier || 'auto') === k ? ' selected' : ''}>${escapeHtml(PM_WB_TIERS[k].label)}</option>`).join('');
         const persona = getUserPersona().name || '我';
+
+        const memberSelectorHtml = grpMain ? (() => {
+            const roster = wbRoster(false) || [];
+            const opts = roster.map(m =>
+                `<option value="${escapeAttr(m.id)}"${m.id === stampedId ? ' selected' : ''}>${escapeHtml(wbMemberName(m))}</option>`
+            ).join('');
+            const canDelete = roster.length > 1;
+            return `
+<div style="display:flex;gap:8px;align-items:center;padding:2px 0 10px;">
+  <select id="pm-wb-member-sel" class="pm-cfg-input" style="flex:1;" onchange="window.__pmWeiboSwitchMember(this.value)">
+    ${opts}
+  </select>
+  <button onclick="window.__pmWeiboDeleteMember('${escapeAttr(stampedId)}')" style="flex-shrink:0;background:${canDelete ? '#ff3b30' : '#d0d0d5'};color:#fff;border:none;border-radius:10px;padding:8px 12px;font-size:13px;cursor:${canDelete ? 'pointer' : 'default'};font-weight:600;" ${canDelete ? '' : 'disabled'}>删除</button>
+</div>`;
+        })() : '';
+
         makeOverlay(`
 <div class="pm-modal pm-modal-wide wb-modal${wbDarkCls()}">
-  <div class="pm-modal-header"><b>${label}设置</b><span onclick="window.__pmWeiboSaveIdentity()" class="pm-modal-close">✕</span></div>
+  <div class="pm-modal-header"><b>${label}</b><span onclick="window.__pmWeiboSaveIdentity()" class="pm-modal-close">✕</span></div>
   <div class="pm-modal-scroll wb-form">
-    <div class="wb-form-h">— ${me ? '你自己的微博号' : '角色的' + label + '（博主本人）'} —</div>
+    ${grpMain ? `<div class="wb-form-h">— 成员身份 —</div>${memberSelectorHtml}` : `<div class="wb-form-h">— ${me ? '你自己的微博号' : '角色的' + label + '（博主本人）'} —</div>`}
+    <input type="hidden" id="pm-wb-member-id" value="${escapeAttr(stampedId)}">
     <div style="display:flex;justify-content:center;">
-      ${wbAvPickHtml('pm-wb-av-slot', wbAvatarFor(__pmWeiboAcct), '头像')}
+      ${wbAvPickHtml('pm-wb-av-slot', grpMain ? wbMemberAvatar(ident) : wbAvatarFor(__pmWeiboAcct), '头像')}
     </div>
     <div class="pm-cfg-label">昵称</div>
-    <input id="pm-wb-name" class="pm-cfg-input" placeholder="${escapeAttr(me ? persona : wbDefaultName())}" value="${escapeAttr(ident.name || '')}">
+    <input id="pm-wb-name" class="pm-cfg-input" placeholder="${escapeAttr(grpMain ? ident.realName : (me ? persona : wbDefaultName()))}" value="${escapeAttr(ident.name || '')}">
     <div class="pm-cfg-label">认证类型</div>
     <select id="pm-wb-vtype" class="pm-cfg-input">${vOpts}</select>
     <div class="wb-form-note">红V＝名人（昵称显橙色），蓝V＝官方或机构（例如 XX工作室），普通＝没有认证标。</div>
@@ -4885,7 +5339,7 @@ function wbGridHtml(images, clip, pid) {
     <textarea id="pm-wb-bio" class="pm-cfg-input" rows="${me ? 3 : 4}" style="resize:vertical;font-family:inherit;" placeholder="${escapeAttr(me
                 ? '例如：八百万粉的美食博主 / 同公司的实习生小号 / ' + wbCharName() + '知道这个号是我'
                 : '例如：三万粉的旅行博主，爱吐槽，粉丝黏性高')}">${escapeHtml(ident.bio || '')}</textarea>
-    ${me ? `<div class="wb-form-note">默认你在微博上是<b>匿名路人</b>，${escapeHtml(wbCharName())}并不知道这个号是你本人。想让 TA 认出你，二选一：把昵称改成你的真名「${escapeHtml(persona)}」，或者在上面写明"${escapeHtml(wbCharName())}知道这个账号是我"。填了身份设定后，评论区的网友也会照这个身份对待你。</div>`
+    ${me ? `<div class="wb-form-note">默认你在微博上是<b>匿名路人</b>，${escapeHtml(wbCharName())}并不知道这个号是你本人。想让 TA 认出你，把昵称改成你的真名，或者在上面写明TA知道这个账号是我。</div>`
                 : `
     <div class="wb-form-row wb-form-sep">
       <span>固定网友</span>
@@ -4896,6 +5350,32 @@ function wbGridHtml(images, clip, pid) {
   </div>
 </div>`);
         document.getElementById('pm-wb-av-slot')?.addEventListener('click', () => wbPickAvatar());
+    };
+
+    // 切换成员下拉框：先把当前表单收进内存，再用新成员 id 重绘
+    window.__pmWeiboSwitchMember = (newId) => {
+        wbCollectIdentityForm();
+        window.__pmWeiboIdentityModal(newId);
+    };
+
+    // 删除名册成员，同时删掉 TA 的所有博文
+    window.__pmWeiboDeleteMember = (id) => {
+        const roster = wbRoster(false);
+        if (!roster || roster.length <= 1) { alert('至少保留一个成员，无法删除'); return; }
+        const m = roster.find(x => x.id === id);
+        if (!m) return;
+        const posts = (wbPosts(false, 'main') || []).filter(p => p.author === id);
+        const msg = posts.length > 0
+            ? `确定要删除「${wbMemberName(m)}」吗？TA 的 ${posts.length} 条微博也会一并删除。`
+            : `确定要删除「${wbMemberName(m)}」吗？`;
+        if (!confirm(msg)) return;
+        const pId = getPersonaStorageId();
+        window.__pmWeiboIdentity[pId].__groupRoster = roster.filter(x => x.id !== id);
+        if (window.__pmWeiboPosts[pId]?.main)
+            window.__pmWeiboPosts[pId].main = window.__pmWeiboPosts[pId].main.filter(p => p.author !== id);
+        Promise.all([saveWeiboPosts(), saveWeiboIdentity()]);
+        const remaining = window.__pmWeiboIdentity[pId].__groupRoster;
+        window.__pmWeiboIdentityModal(remaining[0]?.id);
     };
 
     // 可点的头像位。以前只是个透明圆，看着是空白却能点出选图框；
@@ -4917,10 +5397,18 @@ function wbGridHtml(images, clip, pid) {
         window.__pmShowWeibo();
         requestAnimationFrame(() => { saveWeiboIdentity(); });
     };
+    // 表单里 stamp 的成员 id 决定写谁 —— 不能依赖"当前选中成员"这种模块级状态：
+    // 下拉框 onchange 若先重绘，收集时目标已指向新成员，旧表单的值就写到新成员身上了
+    function wbIdentityFormTarget() {
+        const stamped = document.getElementById('pm-wb-member-id')?.value || '';
+        if (stamped) return wbRosterMember(stamped);
+        return wbCurIdent(true);
+    }
     function wbCollectIdentityForm() {
-        const ident = wbCurIdent(true);
         const g = (id) => document.getElementById(id);
         if (!g('pm-wb-name')) return; // 弹窗已经不在了，别把空值写回去
+        const ident = wbIdentityFormTarget();
+        if (!ident) return;           // 成员已被删除
         ident.name = g('pm-wb-name')?.value.trim() || '';
         ident.bio = g('pm-wb-bio')?.value.trim() || '';
         ident.vType = g('pm-wb-vtype')?.value || '';
@@ -4929,21 +5417,27 @@ function wbGridHtml(images, clip, pid) {
         if (g('pm-wb-fixedfans')) ident.fixedFans = g('pm-wb-fixedfans').classList.contains('is-on');
     }
     window.__pmWeiboClearFans = () => {
-        const ident = wbIdentity(true); ident.fans = [];
-        saveWeiboIdentity(); wbToast('已清空');
-        window.__pmWeiboIdentityModal();
+        // 重绘前先收表单，否则点这个按钮会吞掉未保存的昵称/简介编辑
+        wbCollectIdentityForm();
+        const editingId = document.getElementById('pm-wb-member-id')?.value || '';
+        const ident = wbIdentityFormTarget();
+        if (ident) { ident.fans = []; saveWeiboIdentity(); wbToast('已清空'); }
+        window.__pmWeiboIdentityModal(editingId || undefined);
     };
 
     // 头像选择：与短信头像同款（URL 或相册单张），存 IDB 不建库
     // who: 'char' = 角色这个号的头像；'self' = 用户在评论区的头像
     function wbPickAvatar() {
         wbCollectIdentityForm(); // 换页会丢表单，先把身份页里已填的东西收进内存
-        const target = wbCurIdent(true);
+        // 目标按表单里 stamp 的成员 id 解析，跨 async FileReader 也不会写错人
+        const editingId = document.getElementById('pm-wb-member-id')?.value || '';
+        const target = wbIdentityFormTarget();
+        if (!target) return;
         const cur = target.avatar || '';
         const urlVal = (cur && !cur.startsWith('data:')) ? cur : '';
         makeOverlay(`
 <div class="pm-modal wb-modal${wbDarkCls()}">
-  <div class="pm-modal-header"><b>设置头像</b><span onclick="window.__pmWeiboIdentityModal()" class="pm-modal-close">✕</span></div>
+  <div class="pm-modal-header"><b>设置头像</b><span onclick="window.__pmWeiboIdentityModal('${safeJS(editingId)}')" class="pm-modal-close">✕</span></div>
   <div class="wb-form">
     ${cur ? `<img src="${escapeAttr(cur)}" style="width:56px;height:56px;border-radius:50%;object-fit:cover;align-self:center;">` : ''}
     <div class="pm-cfg-label">图片URL</div>
@@ -4960,8 +5454,8 @@ function wbGridHtml(images, clip, pid) {
   </div>
 </div>`);
         const save = (url) => {
-            target.avatar = url;
-            window.__pmWeiboIdentityModal();   // 先回到身份页，别等写盘
+            if (target) target.avatar = url;
+            window.__pmWeiboIdentityModal(editingId || undefined);   // 先回到身份页，别等写盘
             requestAnimationFrame(() => { saveWeiboIdentity(); });
         };
         document.getElementById('pm-wb-av-save')?.addEventListener('click', () => save(document.getElementById('pm-wb-av-url')?.value.trim() || ''));
@@ -4985,19 +5479,19 @@ function wbGridHtml(images, clip, pid) {
         __pmWbCurPost = pid;
         __pmWbReplyTo = null;
         const me = wbIsMe();
-        const ident = wbCurIdent(false) || {};
-        const name = wbDefaultName();
+        // 作者按这条博文解析：群聊大号时是名册成员，其他情况还是当前账号
+        const ident = wbAuthorIdent(post, __pmWeiboAcct);
+        const name = wbIdentName(ident, __pmWeiboAcct);
         const self = wbSelf(false) || {};
-        const charMain = wbIdentOf('main') || {};
         const hasPending = (post.comments || []).some(c => (c.isSelf && !c.answered) || (c.replies || []).some(r => r.isSelf && !r.answered));
 
         const imgs = wbGridHtml(post.images, false, post.id);
 
-        // isSelf = 用户自己；isOwner = 本页博主下场回复；isChar = 角色跑到用户的博文下评论
+        // isSelf = 用户自己；isOwner = 这条博文的作者下场回复
         const cAvatar = (x) => x.isSelf ? wbAvatarFor('me')
-            : (x.isOwner ? wbAvatarFor(__pmWeiboAcct) : (x.isChar ? wbAvatarFor('main') : npcAvatarFor(x.name)));
+            : (x.isOwner ? wbIdentAvatar(ident, __pmWeiboAcct) : npcAvatarFor(x.name));
         const cV = (x) => x.isSelf ? (self.vType || '')
-            : (x.isOwner ? (ident.vType || '') : (x.isChar ? (charMain.vType || '') : (x.v || (x.vip ? 'red' : ''))));
+            : (x.isOwner ? (ident.vType || '') : (x.v || (x.vip ? 'red' : '')));
         const cBadge = (x) => x.isOwner ? '<span class="wb-tag-bozhu">博主</span>' : '';
 
         const comments = (post.comments || []).map(c => {
@@ -5055,12 +5549,12 @@ function wbGridHtml(images, clip, pid) {
   </div>
   <div class="pm-modal-scroll wb-detail">
     <div class="wb-card-top" style="padding:12px 14px 0;">
-      ${wbAvatarHtml(wbAvatarFor(__pmWeiboAcct), 'wb-av-40', ident.vType || '')}
+      ${wbAvatarHtml(wbIdentAvatar(ident, __pmWeiboAcct), 'wb-av-40', ident.vType || '')}
       <div class="wb-card-id">
         <div class="wb-uname${wbNameCls(ident.vType || '')}"><span>${escapeHtml(name)}</span></div>
         <div class="wb-meta">${escapeHtml(post.time)}${post.ip ? ' · 发布于 ' + escapeHtml(post.ip) : ''}</div>
       </div>
-      ${me ? '' : `<div class="wb-follow ${ident.followed ? 'is-on' : ''}" onclick="window.__pmWeiboToggleFollow()" role="button" tabindex="0">${ident.followed ? '已关注' : '+ 关注'}</div>`}
+      ${me ? '' : `<div class="wb-follow ${ident.followed ? 'is-on' : ''}" onclick="window.__pmWeiboToggleFollow('${safeJS(post.id)}')" role="button" tabindex="0">${ident.followed ? '已关注' : '+ 关注'}</div>`}
     </div>
     <div class="wb-text" style="padding:8px 14px;">${wbLinkify(post.text)}</div>
     ${imgs}
@@ -5113,8 +5607,18 @@ function wbGridHtml(images, clip, pid) {
     };
 
     // 关注：纯 UI 状态，不进 prompt，不影响 AI 生成
-    window.__pmWeiboToggleFollow = async () => {
-        const ident = wbIdentity(true);
+    window.__pmWeiboToggleFollow = async (pid) => {
+        // 群聊里关注的是「这条博文的作者」，而不是整个账号 —— 否则关注甲会让乙丙一起变「已关注」。
+        // 不能走 wbAuthorIdent：它用 create=false，单人模式下会返回临时空对象，写进去不落盘。
+        const post = pid ? wbFindPost(pid) : null;
+        let ident;
+        if (post && post.author && wbIsGroupWeibo() && __pmWeiboAcct === 'main') {
+            ident = wbRosterMember(post.author);
+            if (!ident) return;                 // 作者已被删除，没有可写的目标
+        } else {
+            ident = wbIdentity(true);
+            if (!ident) return;
+        }
         ident.followed = !ident.followed;
         saveWeiboIdentity();
         wbToast(ident.followed ? '已关注' : '已取消关注');
@@ -5290,7 +5794,6 @@ function wbGridHtml(images, clip, pid) {
             if (count) count.textContent = t.length;
         });
         const fileInput = document.getElementById('pm-wb-compose-file');
-        const grid = document.getElementById('pm-wb-compose-grid');
         fileInput?.addEventListener('change', (e) => {
             const files = Array.from(e.target.files || []);
             if (!files.length) return;
@@ -5522,6 +6025,40 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-name{color:var(--pm-name-color,#000) !important;}
 .pm-input{background:var(--pm-input-bg,#f2f2f7) !important;color:var(--pm-text,#000) !important;}
 
+/* ── 边框效果（外观 tab → 边框效果）───────────────────────────────
+   要点:机身 background 默认铺到 border-box,边框那一圈下面压着不透明底色。
+   想让边框透出背后的酒馆界面,必须同时 background-clip:padding-box,
+   否则透明边框透出来的是自己的白底而不是页面。
+   这几条选择器都是 #id + [attr],特异性高于 5981 行那条 #pm-iphone,盖得住。 */
+
+/* 磨砂:边框带 alpha + backdrop-filter 把背后糊掉。滤镜作用于整个 border-box,
+   但内容区被 .pm-main-ui 的不透明底盖住,所以只在边框那一圈看得见效果。 */
+#pm-iphone[data-bfx="frost"]{
+    border-color:var(--pm-border-a,rgba(26,26,26,.55)) !important;
+    background-clip:padding-box !important;
+    backdrop-filter:blur(14px) saturate(1.3);
+    -webkit-backdrop-filter:blur(14px) saturate(1.3);
+}
+/* 半透明:只透不糊,不加滤镜,没有 backdrop-filter 那些副作用 */
+#pm-iphone[data-bfx="glass"]{
+    border-color:var(--pm-border-a,rgba(26,26,26,.4)) !important;
+    background-clip:padding-box !important;
+}
+/* 描边:不碰透明度,用分层外阴影在边框外面叠一圈亮边+一圈暗边,模拟中框高光。
+   box-shadow 不受 overflow:hidden 裁剪,所以这条能画到机身外面。 */
+#pm-iphone[data-bfx="rim"]{
+    box-shadow:0 0 0 1px rgba(255,255,255,.5),0 0 0 2.5px rgba(0,0,0,.28),0 20px 60px rgba(0,0,0,.45) !important;
+}
+/* 系统开了「减少透明度」就退回实心边框:磨砂/半透明都依赖透明度传达质感,
+   强行保留反而是可读性问题 */
+@media (prefers-reduced-transparency:reduce){
+    #pm-iphone[data-bfx="frost"],#pm-iphone[data-bfx="glass"]{
+        border-color:var(--pm-border,#1a1a1a) !important;
+        background-clip:border-box !important;
+        backdrop-filter:none;-webkit-backdrop-filter:none;
+    }
+}
+
 
 #pm-iphone[data-theme="dark"] .pm-li:hover{background:#2c2c2e;}
 #pm-iphone[data-theme="dark"] .pm-modal{background:#1c1c1e !important;color:#e5e5e5 !important;}
@@ -5569,7 +6106,7 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-cfg-tab{padding:11px 0;font-size:12.5px;}
 .pm-mode-switch{border-radius:14px;padding:4px;gap:4px;}
 .pm-mode-opt{padding:10px 0;border-radius:10px;font-size:12.5px;}
-.pm-select-wrap{gap:8px;}
+/* .pm-select-wrap 的完整规则在下面统一定义（约 6029 行），这里不再重复设 gap */
 .pm-custom-check{width:22px;height:22px;border-width:2.5px;}
 .pm-bg-btn,.pm-theme-chip,.pm-layout-chip{border-radius:10px;}
 .pm-prof-list{border-radius:12px;padding:6px;}
@@ -5588,11 +6125,14 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-nav-left{display:flex;gap:4px;align-items:center;margin-right:auto;}
 #pm-iphone[data-layout="relaxed"] .pm-nav-left{gap:10px;}
 .pm-nav-right{display:flex;gap:4px;justify-content:flex-end;margin-left:auto;}
-.pm-name-wrap{position:absolute !important;left:50%;top:50%;transform:translate(-50%,-50%);display:inline-flex;align-items:center;max-width:60%;pointer-events:auto;}
+/* max-width 从 60% 收到 52%：编辑按钮定位在 left:100%，名字越长它越往右探，
+   60% 时长名字会把它推进 .pm-nav-right 的 🗑/⚙ 里 —— 光把按钮改小治不了根 */
+.pm-name-wrap{position:absolute !important;left:50%;top:50%;transform:translate(-50%,-50%);display:inline-flex;align-items:center;max-width:52%;pointer-events:auto;}
 .pm-name{font-weight:700 !important;font-size:15px !important;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;}
-.pm-name-edit{background:#f0f0f3 !important;border:none !important;color:#666 !important;cursor:pointer;padding:5px !important;line-height:1;flex-shrink:0;border-radius:50% !important;width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;transition:all .2s;position:absolute;left:100%;margin-left:8px;}
+.pm-name-edit{background:#f0f0f3 !important;border:none !important;color:#666 !important;cursor:pointer;padding:3px !important;line-height:1;flex-shrink:0;border-radius:50% !important;width:19px;height:19px;display:inline-flex;align-items:center;justify-content:center;transition:background .2s,color .2s;position:absolute;left:100%;margin-left:6px;}
 .pm-name-edit.is-hidden{display:none !important;}
-.pm-name-edit:hover{background:#007aff !important;color:#fff !important;transform:scale(1.05);}
+/* 不再 scale(1.05)：19px 的按钮一放大又会贴到右侧按钮 */
+.pm-name-edit:hover{background:#007aff !important;color:#fff !important;}
 .pm-name-edit svg{display:block;}
 #pm-iphone[data-layout="relaxed"] .pm-nav-right{gap:10px;}
 #pm-iphone[data-layout="relaxed"] .pm-navbar{padding:8px 14px;min-height:44px;}
@@ -5602,7 +6142,14 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-confirm-btn{background:#ff3b30 !important;color:#fff !important;border:none;border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer;font-weight:600;}
 .pm-cancel-btn{background:#f0f0f0 !important;color:#333 !important;border:none;border-radius:8px;padding:5px 12px;font-size:12px;cursor:pointer;}
 .pm-msg-list{flex:1 !important;overflow-y:auto !important;padding:12px !important;display:flex !important;flex-direction:column !important;gap:7px;background:var(--pm-list-bg,#fff) !important;min-height:0;background-size:cover;background-position:center;}
-.pm-select-wrap{display:flex !important;align-items:flex-end;gap:6px;}
+/* 选择模式：复选框固定在最左边一列，用户和角色的都对齐。
+   包的内容占满剩余宽度，右侧气泡靠自己的 margin-left:auto 贴右边 ——
+   不能靠 align-self，那是横向 flex 里的纵向属性，管不了左右。 */
+.pm-select-wrap{display:flex !important;align-items:center;gap:8px;align-self:stretch !important;width:100% !important;}
+.pm-select-wrap > .pm-row{flex:1;min-width:0;}
+.pm-select-wrap > .pm-bubble.pm-right{margin-left:auto;}
+.pm-select-wrap > .pm-group-bubble-wrap{flex:1;min-width:0;}
+.pm-select-wrap > .pm-director{flex:1;min-width:0;}
 .pm-custom-check{width:20px;height:20px;border-radius:50%;border:2px solid #ccc;cursor:pointer;flex-shrink:0;margin-bottom:4px;transition:all .15s;position:relative;background:#fff !important;}
 .pm-custom-check[data-checked="1"],.pm-custom-check.is-checked{border-color:#007aff;background:#007aff !important;}
 .pm-custom-check[data-checked="1"]::after,.pm-custom-check.is-checked::after{content:'✓';position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:bold;}
@@ -5650,7 +6197,8 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-voice-dur{font-size:12px;opacity:.85;min-width:34px;text-align:right;flex-shrink:0;font-variant-numeric:tabular-nums;line-height:1;}
 .pm-voice-text{background:#f7f7f9;border:1px solid #e5e5e8;color:#333;padding:7px 10px;border-radius:10px;font-size:13px;line-height:1.4;max-width:220px;word-break:break-word;position:relative;}
 .pm-voice-text::before{content:'已转文字';position:absolute;top:-8px;left:8px;font-size:9px;color:#999;background:#fff;padding:0 4px;border-radius:4px;}
-.pm-input-bar{padding:8px 12px 30px !important;display:flex !important;gap:8px;border-top:1px solid var(--pm-navbar-border,#f0f0f0);align-items:center;background:var(--pm-navbar-bg,#fff) !important;flex-shrink:0;}
+/* 底部原来留 30px（模拟 home indicator），实际看起来是一条空白带，收到 12px */
+.pm-input-bar{padding:9px 12px 12px !important;display:flex !important;gap:8px;border-top:1px solid var(--pm-navbar-border,#f0f0f0);align-items:center;background:var(--pm-navbar-bg,#fff) !important;flex-shrink:0;}
 .pm-input{flex:1 !important;min-width:0 !important;background:#f2f2f7 !important;color:#000 !important;border:none !important;border-radius:20px !important;padding:9px 14px !important;outline:none !important;font-size:14px !important;font-family:inherit !important;}
 .pm-input:disabled{opacity:.5;}
 .pm-up-btn{width:32px !important;height:32px !important;background:#007aff !important;color:#fff !important;border:none !important;border-radius:50% !important;cursor:pointer;font-size:16px !important;font-weight:bold;display:flex !important;align-items:center !important;justify-content:center !important;flex-shrink:0;}
@@ -5692,20 +6240,32 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-cfg-tab:hover{color:#555;}
 .pm-cfg-tab-active{color:#007aff !important;border-bottom-color:#007aff !important;}
 .pm-tab-pane{animation:pm-fade-in .15s ease;}
+/* 最后一段不画分割线：分区的 border-bottom 是写在 inline style 上的，必须 !important 才盖得住。
+   否则滑到底会看到一条悬空的线，线下面还有一片空白 —— 那条线是「下面还有内容」的信号，但下面没有了 */
+.pm-tab-pane > div:last-child{border-bottom:none !important;}
 @keyframes pm-fade-in{from{opacity:0}to{opacity:1}}
 .pm-bi-bar{padding:8px 14px;background:#fff8e8;border-bottom:1px solid #ffe6a8;font-size:11px;color:#885d00;display:flex;flex-direction:column;gap:3px;}
 .pm-bi-tip{font-weight:600;color:#b87a00;}
 .pm-modal-list{overflow-y:auto;flex:1;padding:6px 8px;max-height:400px;}
-.pm-li{display:flex !important;align-items:center !important;gap:10px;padding:10px;border-radius:12px;}.pm-li:hover{background:#f5f5f5;}
-.pm-li > span{flex:1;font-size:14px !important;color:#007aff !important;font-weight:500;cursor:pointer;display:flex;flex-direction:column;gap:2px;min-width:0;}
-.pm-group-sub{font-size:11px !important;color:#999 !important;font-weight:400 !important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.pm-li i{font-style:normal;font-size:11px;color:#fff !important;background:#ff3b30 !important;padding:3px 9px;border-radius:8px;cursor:pointer;font-weight:600;flex-shrink:0;}
+.pm-li{display:flex !important;align-items:center !important;gap:10px;padding:10px;border-radius:12px;transition:background .15s;}.pm-li:hover{background:#f5f5f7;}
+/* 名字用近黑色而不是通篇蓝：一列全蓝时没有层级，副标题也被压住 */
+.pm-li > span{flex:1;font-size:14px !important;color:#1c1c1e !important;font-weight:600;cursor:pointer;display:flex;flex-direction:column;gap:2px;min-width:0;}
+.pm-group-sub{font-size:11px !important;color:#9a9aa0 !important;font-weight:400 !important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+/* 删除按钮：整列实心红太抢眼，改成淡红底红字，hover 才转实心。
+   常驻显示，不做「hover 才出现」—— 触屏没有 hover，藏起来就点不到了 */
+.pm-li i{font-style:normal;font-size:11px;color:#ff3b30 !important;background:#ffeceb !important;padding:4px 10px;border-radius:8px;cursor:pointer;font-weight:600;flex-shrink:0;transition:background .15s,color .15s;}
+.pm-li i:hover{background:#ff3b30 !important;color:#fff !important;}
 .pm-modal-add{padding:12px 14px 16px;border-top:1px solid #f0f0f0;display:flex;gap:8px;flex-shrink:0;}
 .pm-modal-add input{flex:1;min-width:0;border:1px solid #ddd;border-radius:10px;padding:9px 12px;font-size:13px;outline:none;color:#000 !important;background:#fff !important;}
 .pm-modal-add button{background:#007aff !important;color:#fff !important;border:none;border-radius:10px;padding:9px 14px;font-size:13px;cursor:pointer;font-weight:600;white-space:nowrap;}
-.pm-btn-group{flex:1;background:linear-gradient(135deg,#ff9500,#ff6b00) !important;color:#fff !important;border:none !important;border-radius:10px !important;padding:11px !important;font-size:13px !important;cursor:pointer !important;font-weight:600 !important;}
-.pm-btn-add{flex:1;background:linear-gradient(135deg,#007aff,#0056b3) !important;color:#fff !important;border:none !important;border-radius:10px !important;padding:11px !important;font-size:13px !important;cursor:pointer !important;font-weight:600 !important;}
-.pm-btn-group:hover,.pm-btn-add:hover{filter:brightness(1.05);}
+/* 两个底部按钮：主操作实心蓝，次操作中性灰。原来是橙/蓝两条渐变，互相抢视线 */
+/* 次操作用深色字不用蓝：#007aff 落在 #f1f1f5 上只有约 4:1，13px 粗体不够 AA 的 4.5:1；
+   顺带把蓝色留给「添加联系人」一个主操作，层级更清楚 */
+.pm-btn-group{flex:1;background:#f1f1f5 !important;color:#1c1c1e !important;border:none !important;border-radius:12px !important;padding:11px !important;font-size:13px !important;cursor:pointer !important;font-weight:600 !important;transition:background .15s,transform .12s;}
+.pm-btn-add{flex:1;background:#007aff !important;color:#fff !important;border:none !important;border-radius:12px !important;padding:11px !important;font-size:13px !important;cursor:pointer !important;font-weight:600 !important;transition:background .15s,transform .12s;}
+.pm-btn-group:hover{background:#e6e6ec !important;}
+.pm-btn-add:hover{background:#0069db !important;}
+.pm-btn-group:active,.pm-btn-add:active{transform:scale(.98);}
 .pm-cfg-label{font-size:12px;color:#555;margin-bottom:-4px;}
 .pm-cfg-input{width:100%;border:1px solid #ddd !important;border-radius:10px !important;padding:9px 12px;font-size:13px !important;outline:none;color:#000 !important;background:#fff !important;}
 .pm-cfg-tip{font-size:11px;color:#aaa;text-align:center;padding:4px 0;}
@@ -5729,6 +6289,10 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-layout-row{display:flex;gap:6px;}
 .pm-layout-chip{padding:6px 16px;border-radius:16px;font-size:12px;color:#555;background:#f5f5f5;cursor:pointer;border:2px solid transparent;transition:all .15s;user-select:none;}
 .pm-layout-chip:hover{background:#eee;}.pm-layout-active{border-color:#007aff;color:#007aff;background:#f0f7ff;}
+/* 边框效果四个 chip 要和「效果」标签挤在同一行:弹窗 320px 去掉 padding 只剩 288px,
+   默认 16px 横向 padding 四个加起来放不下会换行,收到 9px */
+#pm-bfx-row{gap:5px;}
+#pm-bfx-row .pm-layout-chip{padding:5px 9px;border-radius:14px;white-space:nowrap;}
 .pm-bg-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .pm-bg-label{font-size:12px;color:#555;font-weight:500;min-width:64px;}
 .pm-bg-btn{background:#f0f0f3;border:1px solid #ddd;border-radius:8px;padding:6px 12px;font-size:12px;color:#555;cursor:pointer;white-space:nowrap;font-family:inherit;}
@@ -5846,6 +6410,14 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .wb-form-row span{font-size:13px;}
 .wb-form-note{font-size:11px;color:#777;line-height:1.6;text-wrap:pretty;}
 .pm-modal.is-dark .wb-form-note{color:#98989d;}
+.wb-alloc-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--wb-line);}
+.wb-alloc-row:last-child{border-bottom:none;}
+.wb-alloc-name{font-size:14px;font-weight:600;color:#1c1c1e;}
+.pm-modal.is-dark .wb-alloc-name{color:#e5e5e5;}
+.wb-alloc-ctl{display:flex;align-items:center;gap:14px;}
+.wb-alloc-btn{background:none;border:1.5px solid var(--wb-orange,#ff8200);color:var(--wb-orange,#ff8200);border-radius:50%;width:28px;height:28px;font-size:16px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;}
+.wb-alloc-n{font-size:18px;font-weight:700;min-width:18px;text-align:center;color:#1c1c1e;}
+.pm-modal.is-dark .wb-alloc-n{color:#e5e5e5;}
 .wb-av-24{width:24px;height:24px;}.wb-av-32{width:32px;height:32px;}
 .wb-av-40{width:40px;height:40px;}.wb-av-56{width:56px;height:56px;}
 .wb-uname{font-size:13px;font-weight:600;color:var(--wb-blue);letter-spacing:-.1px;
@@ -5855,7 +6427,7 @@ comments 给 6-12 条。每条不超过 50 字。`;
 /* 红V=名人，昵称跟着变橙（和微博生成器的 .username.vip 一致）；蓝V/普通保持蓝 */
 .wb-uname.is-vip{color:var(--wb-orange);}
 .wb-meta{font-size:11px;color:var(--wb-sub);margin-top:2.5px;font-variant-numeric:tabular-nums;}
-.wb-text{font-size:13.5px;line-height:1.68;color:#111;margin-top:8px;word-break:break-word;text-wrap:pretty;}
+.wb-text{font-size:13.5px;line-height:1.68;color:#111;margin-top:8px;word-break:break-word;}
 .wb-modal.is-dark .wb-text{color:#e8e8ea;}
 .wb-text-clip{display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical;overflow:hidden;}
 /* #话题#、@某人、超话 一律染蓝，和真微博一致 */
@@ -5887,7 +6459,7 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .wb-follow:active{transform:scale(.95);}
 .wb-follow:focus-visible{outline:2px solid var(--wb-orange);outline-offset:2px;}
 .wb-grid{display:grid;gap:3px;margin-top:8px;padding:0 14px;}
-.wb-detail .wb-grid,.wb-card .wb-grid{padding:0;}
+.wb-card .wb-grid{padding:0;}
 .wb-grid[data-n="1"]{grid-template-columns:1fr;}
 .wb-grid[data-n="2"],.wb-grid[data-n="4"]{grid-template-columns:1fr 1fr;}
 .wb-grid[data-n="3"],.wb-grid[data-n="5"],.wb-grid[data-n="6"],.wb-grid[data-n="7"],.wb-grid[data-n="8"],.wb-grid[data-n="9"]{grid-template-columns:1fr 1fr 1fr;}
@@ -5937,7 +6509,7 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .wb-c-name.is-vip{color:var(--wb-orange);}
 .wb-tag-bozhu{background:var(--wb-orange);color:#fff;font-size:9px;font-weight:500;padding:1.5px 4px;border-radius:3px;
   letter-spacing:.2px;line-height:1.2;}
-.wb-c-text{font-size:13px;line-height:1.58;margin-top:3px;word-break:break-word;text-wrap:pretty;color:#111;}
+.wb-c-text{font-size:13px;line-height:1.58;margin-top:3px;word-break:break-word;color:#111;}
 .wb-modal.is-dark .wb-c-text{color:#e8e8ea;}
 /* 楼中楼里「回复 @某人」的前缀 */
 .wb-c-text .wb-rt{color:var(--wb-blue);font-weight:600;}
