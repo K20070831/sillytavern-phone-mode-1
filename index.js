@@ -438,22 +438,57 @@
         window.__pmRenderNpcAvSetList();
     };
 
+    // 图库多选的暂存区，每次开弹窗清空
+    let __pmNpcAvPick = [];
+    window.__pmNpcAvToggleGal = (el) => {
+        const url = el?.dataset.url; if (!url) return;
+        const at = __pmNpcAvPick.indexOf(url);
+        if (at >= 0) __pmNpcAvPick.splice(at, 1);
+        else {
+            const room = parseInt(el.closest('.pm-modal')?.dataset.room || '0', 10);
+            if (__pmNpcAvPick.length >= room) { alert(`本组只剩 ${room} 个位置。`); return; }
+            __pmNpcAvPick.push(url);
+        }
+        el.classList.toggle('is-picked', at < 0);
+        const c = document.getElementById('pm-npcav-gal-count');
+        if (c) c.textContent = `已选 ${__pmNpcAvPick.length} 张`;
+    };
+
     window.__pmAddNpcAvImage = (si) => {
         const set = window.__pmNpcAvatars[si]; if (!set) return;
         if ((set.images || []).length >= 30) return alert('本组已满 30 张。');
+        __pmNpcAvPick = [];
+        const room = 30 - (set.images || []).length;
+        const galSets = (window.__pmEmojis || []).filter(s => (s.images || []).length);
+        const galBody = galSets.length ? galSets.map(gs => `
+      <div style="margin-bottom:10px;">
+        <div style="font-weight:600;font-size:12px;color:#666;margin-bottom:6px;">${escapeHtml(gs.name)}</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          ${(gs.images || []).map(img => `
+            <div class="wb-gal-cell" data-url="${escapeAttr(img.url)}" onclick="window.__pmNpcAvToggleGal(this)" title="${escapeAttr(img.desc || '')}">
+              <img src="${escapeAttr(img.url)}">
+              <span class="wb-gal-tick">✓</span>
+            </div>`).join('')}
+        </div>
+      </div>`).join('') : '<div style="font-size:12px;color:#aaa;">图库还是空的，先去「表情包管理」添加图片</div>';
         pmSubOverlay(`
-<div class="pm-modal">
+<div class="pm-modal" data-room="${room}">
   <div class="pm-modal-header">
     <b>添加头像 — ${escapeHtml(set.name)}</b>
     <span onclick="document.getElementById('pm-overlay-sub').remove();" class="pm-modal-close">✕</span>
   </div>
-  <div style="padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+  <div class="pm-modal-scroll" style="padding:14px 16px;display:flex;flex-direction:column;gap:10px;max-height:60dvh;overflow-y:auto;">
     <div style="font-size:12px;color:#888;margin-bottom:2px;">图片 URL 或本地上传（可多选）</div>
     <input id="pm-npcav-url" class="pm-cfg-input" placeholder="https://... 或点下方选择文件" style="padding:8px 10px;font-size:13px;border-radius:8px;border:1px solid #ddd;">
     <button onclick="document.getElementById('pm-npcav-file').click()" style="background:#f0f0f3;color:#333;border:1px solid #ddd;border-radius:8px;padding:8px 10px;font-size:12px;cursor:pointer;">📁 上传本地图片（可多选）</button>
     <input id="pm-npcav-file" type="file" accept="image/*" multiple hidden onchange="window.__pmNpcAvFileRead(${si},this)">
     <div id="pm-npcav-preview" style="display:none;flex-wrap:wrap;gap:6px;justify-content:center;"></div>
-    <div style="font-size:11px;color:#aaa;">头像会随机分配给评论区网友，同一个名字始终拿到同一张</div>
+    <div style="display:flex;align-items:center;justify-content:space-between;border-top:1px solid #eee;padding-top:10px;margin-top:2px;">
+      <span style="font-size:12px;color:#888;">从图库选择（可多选，还可选 ${room} 张）</span>
+      <span id="pm-npcav-gal-count" style="font-size:11px;color:#ff8200;font-weight:600;">已选 0 张</span>
+    </div>
+    ${galBody}
+    <div style="font-size:11px;color:#aaa;">头像会随机分配给网友，同名始终拿到同一张</div>
   </div>
   <div class="pm-modal-add">
     <button onclick="window.__pmConfirmAddNpcAvImage(${si})" style="width:100%;background:#ff8200;color:#fff;border:none;border-radius:10px;padding:10px;font-size:13px;cursor:pointer;font-weight:600;">确认添加</button>
@@ -483,10 +518,14 @@
     };
     window.__pmConfirmAddNpcAvImage = (si) => {
         const url = document.getElementById('pm-npcav-url')?.value.trim();
-        if (!url) return alert('请输入图片 URL 或上传图片。');
         const set = window.__pmNpcAvatars[si]; if (!set) return;
         if (!Array.isArray(set.images)) set.images = [];
-        set.images.push(url);
+        const adds = (url ? [url] : []).concat(__pmNpcAvPick);
+        if (!adds.length) return alert('请输入图片 URL、上传图片，或从图库选择。');
+        const room = 30 - set.images.length;
+        if (adds.length > room) return alert(`本组只剩 ${room} 个位置。`);
+        adds.forEach(u => set.images.push(u));
+        __pmNpcAvPick = [];
         saveNpcAvatars();
         document.getElementById('pm-overlay-sub')?.remove();
         window.__pmRenderNpcAvSetList();
