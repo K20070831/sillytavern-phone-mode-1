@@ -1226,11 +1226,24 @@
         const p = document.getElementById('pm-tts-provider')?.value || '';
         // 显示时必须写回 flex：清空 display 会退回 block，让容器上的 gap 失效
         const show = (id, v, mode) => { const el = document.getElementById(id); if (el) el.style.display = v ? (mode || '') : 'none'; };
+        const dbVer = document.getElementById('pm-tts-db-ver')?.value || 'v3';
         show('pm-tts-url', p && p !== 'doubao');
         show('pm-tts-key', !!p);
-        show('pm-tts-doubao-row', p === 'doubao', 'flex');
+        show('pm-tts-db-ver-row', p === 'doubao');
+        // v3 用 X-Api-Key 单头鉴权，不需要 AppID/Cluster；只有旧版 v1 才要
+        show('pm-tts-doubao-row', p === 'doubao' && dbVer === 'v1', 'flex');
         show('pm-tts-voice', !!p);
         show('pm-tts-model-row', p === 'openai' || p === 'minimax');
+        show('pm-tts-preview-btn', !!p);
+        const voiceEl = document.getElementById('pm-tts-voice');
+        if (voiceEl) {
+            if (p === 'doubao') voiceEl.placeholder = dbVer === 'v3'
+                ? '音色 ID（如 zh_female_vv_jupiter_bigtts）'
+                : '音色 ID（如 BV001_streaming）';
+            else if (p === 'openai') voiceEl.placeholder = '音色 ID（如 alloy）';
+            else if (p === 'minimax') voiceEl.placeholder = '音色 ID（如 female-tianmei）';
+            else voiceEl.placeholder = '音色 ID';
+        }
     };
 
     window.__pmTtsUiLoad = () => {
@@ -1241,13 +1254,34 @@
         f('pm-tts-url', c.url); f('pm-tts-key', c.key);
         f('pm-tts-appid', c.appid); f('pm-tts-cluster', c.cluster);
         f('pm-tts-voice', c.voice); f('pm-tts-model', c.model);
+        const dbVerEl = document.getElementById('pm-tts-db-ver');
+        if (dbVerEl) dbVerEl.value = c.dbver || 'v3';
         window.__pmTtsProviderChange();
     };
 
     window.__pmTtsSave = () => {
         const g = id => document.getElementById(id)?.value.trim() || '';
         const p = g('pm-tts-provider');
-        window.__pmConfig.tts = { provider: p, url: g('pm-tts-url'), key: g('pm-tts-key'), appid: g('pm-tts-appid'), cluster: g('pm-tts-cluster'), voice: g('pm-tts-voice'), model: g('pm-tts-model') };
+        window.__pmConfig.tts = { provider: p, url: g('pm-tts-url'), key: g('pm-tts-key'), appid: g('pm-tts-appid'), cluster: g('pm-tts-cluster'), voice: g('pm-tts-voice'), model: g('pm-tts-model'), dbver: g('pm-tts-db-ver') || 'v3' };
+    };
+
+    window.__pmTtsPreview = async () => {
+        const g = id => document.getElementById(id)?.value.trim() || '';
+        const statusEl = document.getElementById('pm-tts-preview-status');
+        const say = (txt, color) => { if (statusEl) { statusEl.textContent = txt; statusEl.style.color = color; } };
+        const tts = { provider: g('pm-tts-provider'), url: g('pm-tts-url'), key: g('pm-tts-key'), appid: g('pm-tts-appid'), cluster: g('pm-tts-cluster'), voice: g('pm-tts-voice'), model: g('pm-tts-model'), dbver: g('pm-tts-db-ver') || 'v3' };
+        if (!tts.provider) return say('请先选择 provider', '#ff9500');
+        if (!tts.key) return say('请先填写 API Key', '#ff9500');
+        say('生成中…', '#888');
+        try {
+            const url = await __pmTtsFetch(tts, '你好，这是音色试听。');
+            const audio = new Audio(url);
+            audio.onended = () => { URL.revokeObjectURL(url); say('', ''); };
+            audio.play();
+            say('▶ 播放中', '#34c759');
+        } catch (e) {
+            say('✗ ' + e.message.slice(0, 80), '#ff3b30');
+        }
     };
 
     window.__pmPlayTTS = async (btn) => {
@@ -1318,19 +1352,61 @@
             return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
         }
         if (provider === 'doubao') {
-            const base = (url || 'https://openspeech.bytedance.com/api/v1/tts').replace(/\/$/, '');
-            const r = await fetch(base, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer;${key}` },
-                body: JSON.stringify({ app: { appid: appid || '', token: key, cluster: cluster || 'volcano_tts' }, user: { uid: 'pm_tts' }, audio: { voice_type: voice || 'BV001_streaming', encoding: 'mp3' }, request: { reqid: Date.now().toString(), text, operation: 'query' } })
-            });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const j = await r.json();
-            if (j.code && j.code !== 3000) throw new Error(j.message || '未知错误');
-            const b64 = j.data;
-            if (!b64) throw new Error('火山引擎未返回音频');
-            const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-            return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+            const ver = tts.dbver || 'v3';
+            if (ver === 'v3') {
+                // 新版：单头 X-Api-Key 鉴权，音频以 chunked 二进制返回。
+                // 火山 v3 的 CORS 白名单不含 x-api-key，浏览器直连必被预检拦下，
+                // 只能借 ST 的 /proxy 转发（需 config.yaml 的 enableCorsProxy: true）
+                const r = await fetch('/proxy/https://openspeech.bytedance.com/api/v3/tts/unidirectional', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Api-Key': key, 'X-Api-Resource-Id': 'seed-tts-2.0', 'X-Api-Request-Id': crypto.randomUUID() },
+                    body: JSON.stringify({ req_params: { text, speaker: voice || 'zh_female_vv_jupiter_bigtts', audio_params: { format: 'mp3', sample_rate: 24000 } } })
+                });
+                if (r.status === 403) throw new Error('ST 的 CORS 代理未开启：config.yaml 设 enableCorsProxy: true 后重启');
+                if (!r.ok) { const t = await r.text().catch(()=>''); throw new Error(`HTTP ${r.status}: ${t.slice(0,120)}`); }
+                const ct = r.headers.get('Content-Type') || '';
+                if (ct.includes('audio') || ct.includes('octet')) {
+                    return URL.createObjectURL(await r.blob());
+                }
+                // 也可能是 application/json（错误） 或 text/event-stream（SSE）
+                const raw = await r.arrayBuffer();
+                // 检测是否是 MP3 magic bytes（0xFF 0xE? 或 0xFF 0xF? 或 ID3）
+                const peek = new Uint8Array(raw, 0, 4);
+                const isMp3 = (peek[0] === 0xFF && (peek[1] & 0xE0) === 0xE0) || (peek[0] === 0x49 && peek[1] === 0x44 && peek[2] === 0x33);
+                if (isMp3) return URL.createObjectURL(new Blob([raw], { type: 'audio/mpeg' }));
+                // 不像音频，按 JSON 处理。chunked/SSE 可能是多行 JSON，每行一段 b64，要拼起来
+                const txt = new TextDecoder().decode(raw);
+                const b64Parts = [];
+                let errMsg = '';
+                for (const line of txt.split('\n')) {
+                    const s = line.replace(/^data:\s*/, '').trim();
+                    if (!s || s === '[DONE]') continue;
+                    let j; try { j = JSON.parse(s); } catch { continue; }
+                    // 20000000 是 v3 的成功码，每行都带，不能当错误
+                    if (j.code && j.code !== 0 && j.code !== 20000000) { errMsg = `${j.code}: ${j.message || ''}`; continue; }
+                    const seg = j.audio || j.data;
+                    if (seg) b64Parts.push(seg);
+                }
+                if (errMsg) throw new Error(errMsg);
+                if (!b64Parts.length) throw new Error('v3 响应无法解析: ' + txt.slice(0, 120));
+                const merged = b64Parts.map(b => Uint8Array.from(atob(b), c => c.charCodeAt(0)));
+                return URL.createObjectURL(new Blob(merged, { type: 'audio/mpeg' }));
+            } else {
+                // 旧版 v1：双头 + AppID/Cluster，返回 JSON 里的 base64
+                const base = 'https://openspeech.bytedance.com/api/v1/tts';
+                const r = await fetch(base, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer;${key}` },
+                    body: JSON.stringify({ app: { appid: appid || '', token: key, cluster: cluster || 'volcano_tts' }, user: { uid: 'pm_tts' }, audio: { voice_type: voice || 'BV001_streaming', encoding: 'mp3' }, request: { reqid: Date.now().toString(), text, operation: 'query' } })
+                });
+                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                const j = await r.json();
+                if (j.code && j.code !== 3000) throw new Error(j.message || '未知错误');
+                const b64 = j.data;
+                if (!b64) throw new Error('火山引擎未返回音频');
+                const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+                return URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' }));
+            }
         }
         throw new Error('未知 TTS provider');
     }
@@ -1343,11 +1419,123 @@
     // 未启用时把下面的输入框全收起来，省得看着像要填
     window.__pmImgProviderChange = () => {
         const p = document.getElementById('pm-img-provider')?.value || '';
-        const show = (id, v) => { const el = document.getElementById(id); if (el) el.style.display = v ? '' : 'none'; };
+        // 容器要显式写回 flex：清空 display 会退回 block，让子元素的 flex:1 和容器 gap 一起失效
+        const show = (id, v, mode) => { const el = document.getElementById(id); if (el) el.style.display = v ? (mode || '') : 'none'; };
         show('pm-img-url', p === 'openai');
         show('pm-img-key', !!p);
-        show('pm-img-model', !!p);
+        show('pm-img-model-wrap', !!p, 'flex');
         show('pm-img-size', !!p);
+        show('pm-img-actions', !!p, 'flex');
+        // NAI 没有 /models 接口，测试连接无从下手；但模型是固定几个，拉取按钮照样有用
+        show('pm-img-test-btn', p !== 'nai');
+        show('pm-img-fetch-models-btn', !!p);
+        const modelEl = document.getElementById('pm-img-model');
+        if (modelEl) {
+            if (p === 'openai') modelEl.placeholder = '模型（如 dall-e-3）';
+            else if (p === 'siliconflow') modelEl.placeholder = '模型（如 black-forest-labs/FLUX.1-schnell，留空用此默认）';
+            else if (p === 'nai') modelEl.placeholder = '模型（如 nai-diffusion-4-5）';
+            else modelEl.placeholder = '模型';
+        }
+    };
+
+    // 硅基流动地址固定，不看用户输入；OpenAI 侧去掉常见的完整路径后缀（404 最常见原因就是多填了路径）
+    function pmImgNormalizeBase(url, provider) {
+        if (provider === 'siliconflow') return 'https://api.siliconflow.cn/v1';
+        if (!url) return 'https://api.openai.com/v1';
+        return url.replace(/\/(images\/generations|v1\/images\/generations|ai\/generate-image)\/?$/, '').replace(/\/$/, '');
+    }
+
+    window.__pmImgTest = async () => {
+        const p = document.getElementById('pm-img-provider')?.value || '';
+        const rawUrl = document.getElementById('pm-img-url')?.value.trim() || '';
+        const key = document.getElementById('pm-img-key')?.value.trim() || '';
+        const statusEl = document.getElementById('pm-img-test-status');
+        if (!key) { if (statusEl) { statusEl.textContent = '请先填写 API Key'; statusEl.style.color = '#ff9500'; } return; }
+        if (statusEl) { statusEl.textContent = '测试中…'; statusEl.style.color = '#888'; }
+        const base = pmImgNormalizeBase(rawUrl, p);
+        try {
+            const r = await fetch(`${base}/models`, { headers: { 'Authorization': `Bearer ${key}` }, signal: AbortSignal.timeout(10000) });
+            if (r.ok || r.status === 200) {
+                if (statusEl) { statusEl.textContent = `✓ 连接成功（${base}）`; statusEl.style.color = '#34c759'; }
+            } else {
+                const t = await r.text().catch(() => '');
+                if (statusEl) { statusEl.textContent = `✗ HTTP ${r.status}${t ? ': ' + t.slice(0,80) : ''}`; statusEl.style.color = '#ff3b30'; }
+            }
+        } catch (e) {
+            if (statusEl) { statusEl.textContent = `✗ ${e.message}`; statusEl.style.color = '#ff3b30'; }
+        }
+    };
+
+    // NAI 固定模型列表
+    const PM_NAI_MODELS = ['nai-diffusion-4-5', 'nai-diffusion-4-5-curated', 'nai-diffusion-4-curated', 'nai-diffusion-3', 'nai-diffusion-3-inpainting', 'nai-diffusion-furry-3'];
+    // OpenAI 兼容端点的生图模型关键词过滤（通用中转站会返回几百个对话模型，这里只留生图相关的）
+    const PM_IMG_MODEL_KEYWORDS = /dall-?e|flux|stable.?diff|sdxl|sd[_\-\s]|kolors|seedream|hunyuan|qwen.?vl.?instruct|imagen|midjourney|playground|pixart|ideogram|cogview|emu|wanx|janus/i;
+
+    let __pmImgModelList = [];
+
+    // 复用 API 页那套弹层：搜索框 + 选项列表，点箭头开合
+    window.__pmImgShowModelPicker = () => {
+        const existing = document.getElementById('pm-model-dropdown');
+        if (existing) { existing.remove(); return; }
+        if (!__pmImgModelList.length) {
+            const s = document.getElementById('pm-img-test-status');
+            if (s) { s.textContent = '⚠️ 先点「拉取模型」'; s.style.color = '#ff9500'; }
+            return;
+        }
+        const input = document.getElementById('pm-img-model'), rect = input.getBoundingClientRect();
+        const dd = document.createElement('div'); dd.id = 'pm-model-dropdown'; dd.className = 'pm-model-dropdown';
+        if (POPOVER_SUPPORTED) dd.setAttribute('popover', 'manual');
+        dd.innerHTML = `<input class="pm-model-search" placeholder="🔍 搜索..." /><div class="pm-model-options"></div>`;
+        dd.style.left = rect.left + 'px'; dd.style.top = (rect.bottom + 4) + 'px'; dd.style.width = rect.width + 'px';
+        document.body.appendChild(dd); if (dd.showPopover) try { dd.showPopover(); } catch (e) {}
+        const optsDiv = dd.querySelector('.pm-model-options');
+        const render = (f = '') => {
+            const fl = f.toLowerCase(), filtered = __pmImgModelList.filter(m => !fl || m.toLowerCase().includes(fl));
+            optsDiv.innerHTML = filtered.length ? filtered.map(m => `<div class="pm-model-opt" data-m="${escapeAttr(m)}">${escapeHtml(m)}</div>`).join('') : '<div class="pm-model-empty">无匹配</div>';
+            optsDiv.querySelectorAll('.pm-model-opt').forEach(el => el.addEventListener('click', () => { input.value = el.dataset.m; dd.remove(); }));
+        };
+        render(); dd.querySelector('.pm-model-search').addEventListener('input', function () { render(this.value); }); dd.querySelector('.pm-model-search').focus();
+        setTimeout(() => { const closer = (e) => { if (!dd.contains(e.target) && e.target.id !== 'pm-img-model-arrow') { dd.remove(); document.removeEventListener('click', closer, true); } }; document.addEventListener('click', closer, true); }, 0);
+    };
+
+    function pmImgShowModelList(ids, note, statusEl) {
+        __pmImgModelList = ids;
+        if (statusEl) { statusEl.textContent = `✓ ${note}`; statusEl.style.color = '#34c759'; }
+    }
+
+    window.__pmImgFetchModels = async () => {
+        const p = document.getElementById('pm-img-provider')?.value || '';
+        const rawUrl = document.getElementById('pm-img-url')?.value.trim() || '';
+        const key = document.getElementById('pm-img-key')?.value.trim() || '';
+        const statusEl = document.getElementById('pm-img-test-status');
+
+        if (p === 'nai') {
+            pmImgShowModelList(PM_NAI_MODELS, `${PM_NAI_MODELS.length} 个 NAI 固定模型，从列表选择`, statusEl);
+            return;
+        }
+
+        if (!p) return;
+        if (!key) { if (statusEl) { statusEl.textContent = '请先填写 API Key'; statusEl.style.color = '#ff9500'; } return; }
+        if (statusEl) { statusEl.textContent = '拉取中…'; statusEl.style.color = '#888'; }
+        const base = pmImgNormalizeBase(rawUrl, p);
+        try {
+            const url = p === 'siliconflow'
+                ? `${base}/models?type=image&sub_type=text-to-image&page=1&page_size=50`
+                : `${base}/models`;
+            const r = await fetch(url, { headers: { 'Authorization': `Bearer ${key}` }, signal: AbortSignal.timeout(10000) });
+            if (!r.ok) { const t = await r.text().catch(()=>''); throw new Error(`HTTP ${r.status}: ${t.slice(0,80)}`); }
+            const j = await r.json();
+            let ids = (j.data || []).map(m => m.id).filter(id => typeof id === 'string' && id);
+            let note = `已拉取 ${ids.length} 个模型，从列表选择`;
+            if (p === 'openai') {
+                const hits = ids.filter(id => PM_IMG_MODEL_KEYWORDS.test(id));
+                if (hits.length) { note = `已筛出 ${hits.length} 个生图模型（共 ${ids.length} 个），从列表选择`; ids = hits; }
+            }
+            if (!ids.length) { if (statusEl) { statusEl.textContent = '未返回模型列表'; statusEl.style.color = '#ff9500'; } return; }
+            pmImgShowModelList(ids, note, statusEl);
+        } catch (e) {
+            if (statusEl) { statusEl.textContent = `✗ ${e.message}`; statusEl.style.color = '#ff3b30'; }
+        }
     };
 
     window.__pmImgUiLoad = () => {
@@ -1411,14 +1599,63 @@
         });
     }
 
-    async function pmImgFetch(prompt) {
+    // 硅基流动返回的是临时 URL，得自己拉回来转 dataURL（链接一小时后失效，不能直接存）
+    async function pmImgUrlToData(url, signal) {
+        const r = await fetch(url, { signal });
+        if (!r.ok) throw new Error(`取图失败 HTTP ${r.status}`);
+        const blob = await r.blob();
+        const dataUrl = await new Promise((res, rej) => {
+            const fr = new FileReader();
+            fr.onload = () => res(fr.result);
+            fr.onerror = () => rej(new Error('图片读取失败'));
+            fr.readAsDataURL(blob);
+        });
+        return await pmImgCompress(dataUrl);
+    }
+
+    const PM_IMG_TIMEOUT = 120000;
+
+    // 转圈 + 秒数 + 点一下取消。compact 给微博小格子用，只放圈和秒数
+    function pmImgSpin(el, compact, onCancel) {
+        el.innerHTML = compact
+            ? `<div class="pm-img-load is-compact"><span class="pm-img-ring"></span><span class="pm-img-sec">0s</span></div>`
+            : `<div class="pm-img-load"><span class="pm-img-ring"></span><span class="pm-img-sec">0s</span><span class="pm-img-hint">点击取消</span></div>`;
+        const t0 = Date.now();
+        const secEl = el.querySelector('.pm-img-sec');
+        const timer = setInterval(() => {
+            if (secEl) secEl.textContent = Math.round((Date.now() - t0) / 1000) + 's';
+        }, 250);
+        // capture + stopImmediatePropagation：占位格自带 inline onclick，不拦住会又发一次请求
+        const click = (e) => { e.stopImmediatePropagation(); e.preventDefault(); onCancel(); };
+        el.addEventListener('click', click, true);
+        return () => { clearInterval(timer); el.removeEventListener('click', click, true); };
+    }
+
+    // 统一包一层：AbortController + 超时 + 转圈生命周期
+    async function pmImgRun(el, prompt, compact) {
+        const ac = new AbortController();
+        let cancelled = false;
+        const stopSpin = pmImgSpin(el, compact, () => { cancelled = true; ac.abort(); });
+        const to = setTimeout(() => ac.abort(), PM_IMG_TIMEOUT);
+        try {
+            return await pmImgFetch(prompt, ac.signal);
+        } catch (e) {
+            if (e.name === 'AbortError') throw new Error(cancelled ? '已取消' : '超时（120s）');
+            throw e;
+        } finally {
+            clearTimeout(to);
+            stopSpin();
+        }
+    }
+
+    async function pmImgFetch(prompt, signal) {
         const cfg = window.__pmConfig.img || {};
         if (!cfg.provider) throw new Error('未配置生图 API');
         const [w, h] = (cfg.size || '1024x1024').split('x').map(Number);
         if (cfg.provider === 'openai') {
-            const base = (cfg.url || 'https://api.openai.com/v1').replace(/\/$/, '');
+            const base = pmImgNormalizeBase(cfg.url, 'openai');
             const r = await fetch(`${base}/images/generations`, {
-                method: 'POST',
+                method: 'POST', signal,
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.key}` },
                 body: JSON.stringify({ model: cfg.model || 'dall-e-3', prompt, n: 1, size: cfg.size || '1024x1024', response_format: 'b64_json' })
             });
@@ -1428,10 +1665,26 @@
             if (!b64) throw new Error('OpenAI 未返回图片');
             return await pmImgCompress(`data:image/png;base64,${b64}`);
         }
+        if (cfg.provider === 'siliconflow') {
+            const base = pmImgNormalizeBase(cfg.url, 'siliconflow');
+            // 硅基流动的 image_size 是白名单，832x1216 这类会被 400 掉，换成同比例的合法值
+            const sfModel = cfg.model || 'black-forest-labs/FLUX.1-schnell';
+            const sfSize = { '832x1216': '960x1280', '1216x832': '1024x1024' }[cfg.size] || cfg.size || '1024x1024';
+            const r = await fetch(`${base}/images/generations`, {
+                method: 'POST', signal,
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.key}` },
+                body: JSON.stringify({ model: sfModel, prompt, image_size: sfSize, batch_size: 1, num_inference_steps: /schnell/i.test(sfModel) ? 4 : 20, guidance_scale: 7.5 })
+            });
+            if (!r.ok) { const t = await r.text(); throw new Error(`HTTP ${r.status}: ${t.slice(0, 120)}`); }
+            const j = await r.json();
+            const url = j.images?.[0]?.url || j.data?.[0]?.url;
+            if (!url) throw new Error('硅基流动未返回图片');
+            return await pmImgUrlToData(url, signal);
+        }
         if (cfg.provider === 'nai') {
             const base = (cfg.url || 'https://image.novelai.net').replace(/\/$/, '');
             const r = await fetch(`${base}/ai/generate-image`, {
-                method: 'POST',
+                method: 'POST', signal,
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.key}` },
                 body: JSON.stringify({ input: prompt, model: cfg.model || 'nai-diffusion-4-5', action: 'generate', parameters: { width: w || 832, height: h || 1216, n_samples: 1, sampler: 'k_euler', steps: 28, scale: 6, noise_schedule: 'karras' } })
             });
@@ -1463,9 +1716,8 @@
         const key = `chat:${sid}:${desc}`;
         const cached = pmImgFind(sid, key);
         if (cached) { el.innerHTML = `<img src="${escapeAttr(cached.dataUrl)}" style="max-width:100%;border-radius:10px;display:block;">`; el.classList.add('has-img'); return; }
-        el.innerHTML = '<span class="wb-spin" style="font-size:18px;">⏳</span>';
         try {
-            const dataUrl = await pmImgFetch(desc);
+            const dataUrl = await pmImgRun(el, desc);
             pmImgEvict(sid);
             window.__pmImgStore.push({ sid, key, dataUrl, ts: Date.now() });
             await pmImgSave();
@@ -1496,9 +1748,8 @@
         const key = `wb:${pid}:${imgIdx}`;
         const cached = pmImgFind(sid, key);
         if (cached) { __pmApplyWbImg(el, cached.dataUrl); return; }
-        el.innerHTML = '<span class="wb-spin" style="font-size:18px;">⏳</span>';
         try {
-            const dataUrl = await pmImgFetch(desc);
+            const dataUrl = await pmImgRun(el, desc, true);
             pmImgEvict(sid);
             window.__pmImgStore.push({ sid, key, dataUrl, ts: Date.now() });
             await pmImgSave();
@@ -3151,13 +3402,13 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
       <div style="padding:14px 16px 12px;border-top:1px solid #f0f0f0;">
         <div class="pm-cfg-label" style="margin-bottom:10px;">📱 机身边框</div>
         <div style="display:flex;gap:8px;align-items:center;">
+          <label class="pm-cfg-label" style="margin:0;flex-shrink:0;">效果</label>
+          <div id="pm-bfx-row" class="pm-layout-row">${borderFxBtns}</div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:12px;align-items:center;">
           <label class="pm-cfg-label" style="margin:0;flex-shrink:0;">颜色</label>
           <input id="pm-border-color" type="color" value="${t.borderColor || '#1a1a1a'}" onchange="window.__pmSetBorderColor()" class="pm-color-pick">
           <button onclick="document.getElementById('pm-border-color').value='#1a1a1a';window.__pmSetBorderColor()" class="pm-color-clear">重置</button>
-        </div>
-        <div style="display:flex;gap:8px;margin-top:12px;align-items:center;">
-          <label class="pm-cfg-label" style="margin:0;flex-shrink:0;">效果</label>
-          <div id="pm-bfx-row" class="pm-layout-row">${borderFxBtns}</div>
         </div>
       </div>
       <div style="padding:12px 16px 12px;border-top:1px solid #f0f0f0;">
@@ -3209,18 +3460,29 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
           <select id="pm-img-provider" class="pm-cfg-input" style="padding:8px 10px;" onchange="window.__pmImgProviderChange()">
             <option value="">— 未启用 —</option>
             <option value="openai">OpenAI / 兼容接口</option>
+            <option value="siliconflow">硅基流动（SiliconFlow）</option>
             <option value="nai">NovelAI (NAI)</option>
           </select>
-          <input id="pm-img-url" class="pm-cfg-input" placeholder="API 地址（OpenAI 兼容时填，NAI 留空）" style="display:none;">
+          <input id="pm-img-url" class="pm-cfg-input" placeholder="API 地址（留空用 api.openai.com/v1，只填到 /v1）" style="display:none;">
           <input id="pm-img-key" class="pm-cfg-input" placeholder="API Key" style="display:none;">
-          <input id="pm-img-model" class="pm-cfg-input" placeholder="模型（OpenAI: dall-e-3 | NAI: nai-diffusion-4-5）" style="display:none;">
+          <div style="display:none;flex-direction:column;gap:6px;" id="pm-img-model-wrap">
+            <div class="pm-model-row">
+              <input id="pm-img-model" class="pm-cfg-input" placeholder="模型">
+              <button id="pm-img-model-arrow" type="button" onclick="window.__pmImgShowModelPicker()">▼</button>
+            </div>
+          </div>
           <select id="pm-img-size" class="pm-cfg-input" style="padding:8px 10px;display:none;">
             <option value="1024x1024">1024×1024（方形）</option>
             <option value="832x1216">832×1216（竖图，NAI 默认）</option>
             <option value="1216x832">1216×832（横图）</option>
           </select>
+          <div id="pm-img-actions" style="display:none;gap:6px;flex-direction:row;flex-wrap:wrap;width:100%;">
+            <button id="pm-img-test-btn" onclick="window.__pmImgTest()" style="flex:1;min-width:80px;background:#007aff;color:#fff;border:none;border-radius:9px;padding:7px 10px;font-size:12px;cursor:pointer;font-weight:600;">🔌 测试连接</button>
+            <button id="pm-img-fetch-models-btn" onclick="window.__pmImgFetchModels()" style="display:none;flex:1;min-width:80px;background:#5856d6;color:#fff;border:none;border-radius:9px;padding:7px 10px;font-size:12px;cursor:pointer;font-weight:600;">📋 拉取模型</button>
+          </div>
+          <div id="pm-img-test-status" class="pm-img-status"></div>
         </div>
-        <div class="pm-cfg-tip" style="text-align:left;margin-top:6px;">配置后点击聊天/微博里的图片描述即可生成，每聊天保存 30 张，全局上限 300 张</div>
+        <div class="pm-cfg-tip" style="text-align:left;margin-top:6px;">配置后点击聊天/微博里的图片描述即可生成，每聊天保存 30 张，全局上限 300 张<br>⚠️ URL 只填到 <code style="font-size:10px;background:#f2f2f7;padding:1px 4px;border-radius:4px;">/v1</code> 为止，不要带 <code style="font-size:10px;background:#f2f2f7;padding:1px 4px;border-radius:4px;">/images/generations</code></div>
       </div>
       <div style="padding:12px 16px 12px;border-bottom:1px solid #f0f0f0;">
         <div class="pm-cfg-label" style="margin-bottom:10px;">🔊 语音合成（TTS）</div>
@@ -3233,6 +3495,12 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
           </select>
           <input id="pm-tts-url" class="pm-cfg-input" placeholder="API 地址（留空用默认）" style="display:none;">
           <input id="pm-tts-key" class="pm-cfg-input" placeholder="API Key" style="display:none;">
+          <div id="pm-tts-db-ver-row" style="display:none;">
+            <select id="pm-tts-db-ver" class="pm-cfg-input" style="padding:8px 10px;" onchange="window.__pmTtsProviderChange()">
+              <option value="v3">新版 v3（X-Api-Key，推荐）</option>
+              <option value="v1">旧版 v1（AppID + Cluster）</option>
+            </select>
+          </div>
           <div id="pm-tts-doubao-row" style="display:none;flex-direction:column;gap:8px;">
             <input id="pm-tts-appid" class="pm-cfg-input" placeholder="AppID">
             <input id="pm-tts-cluster" class="pm-cfg-input" placeholder="Cluster（如 volcano_tts）">
@@ -3241,6 +3509,8 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
           <div id="pm-tts-model-row" style="display:none;">
             <input id="pm-tts-model" class="pm-cfg-input" placeholder="模型（如 tts-1、speech-01-turbo）">
           </div>
+          <button id="pm-tts-preview-btn" onclick="window.__pmTtsPreview()" style="display:none;background:#34c759;color:#fff;border:none;border-radius:9px;padding:7px 10px;font-size:12px;cursor:pointer;font-weight:600;">🎧 试听音色</button>
+          <div id="pm-tts-preview-status" class="pm-img-status"></div>
         </div>
         <div class="pm-cfg-tip" style="text-align:left;margin-top:6px;">配置后角色语音条右侧出现 🔊 按钮，点击即可播放</div>
       </div>
@@ -6161,7 +6431,7 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-prof-list{border-radius:12px;padding:6px;}
 .pm-prof-li{padding:8px 10px;border-radius:10px;}
 .pm-color-pick{width:36px;height:32px;border-radius:8px;}
-#pm-model-arrow{border-radius:12px;width:40px;}
+#pm-model-arrow,#pm-img-model-arrow{border-radius:12px;width:40px;}
 .pm-model-opt{padding:9px 14px;font-size:13px;border-radius:6px;margin:1px 4px;border-bottom:none;height:auto;line-height:1.4;}
 .pm-model-opt:hover{background:#f0f7ff;}
 
@@ -6229,6 +6499,15 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-t-icon{width:34px;height:34px;background:rgba(255,255,255,.25);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:800;}
 .pm-t-info{display:flex;flex-direction:column;gap:1px;}.pm-t-info b{font-size:12px;opacity:.85;}.pm-t-info span{font-size:17px;font-weight:700;}
 .pm-img-card{background:#f2f2f7;border:1px solid #e0e0e0;padding:12px 14px;border-radius:14px;color:#555;font-size:13px;text-align:center;}
+.pm-img-load{display:flex;align-items:center;justify-content:center;gap:7px;padding:10px 4px;font-size:12px;color:#888;}
+.pm-img-load.is-compact{padding:4px 2px;gap:4px;font-size:11px;}
+.pm-img-ring{display:inline-block;width:16px;height:16px;border-radius:50%;border:2px solid #ddd;border-top-color:#007aff;animation:pm-spin .7s linear infinite;flex-shrink:0;}
+.pm-img-load.is-compact .pm-img-ring{width:12px;height:12px;}
+.pm-img-sec{font-variant-numeric:tabular-nums;min-width:24px;}
+.pm-img-hint{color:#bbb;font-size:11px;}
+/* 状态行：没内容时整行收起，否则空的 min-height 会在按钮和下方说明之间留一道空白 */
+.pm-img-status{font-size:11.5px;color:#888;min-height:16px;padding:0 2px;}
+.pm-img-status:empty{display:none;}
 .pm-voice-wrap{display:flex;flex-direction:column;gap:4px;align-items:inherit;}
 .pm-voice-row{display:flex;align-items:center;gap:6px;}
 .pm-special.pm-right .pm-voice-wrap{align-items:flex-end;}.pm-special.pm-left .pm-voice-wrap{align-items:flex-start;}
@@ -6347,8 +6626,8 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .pm-bg-btn{background:#f0f0f3;border:1px solid #ddd;border-radius:8px;padding:6px 12px;font-size:12px;color:#555;cursor:pointer;white-space:nowrap;font-family:inherit;}
 .pm-bg-btn:hover{background:#e5e5e8;}.pm-bg-del{color:#ff3b30 !important;border-color:#ffc8c8 !important;}
 .pm-model-row{display:flex;gap:6px;}.pm-model-row .pm-cfg-input{flex:1;}
-#pm-model-arrow{background:#f0f0f3;border:1px solid #ddd;border-radius:10px;width:38px;cursor:pointer;font-size:12px;color:#555;flex-shrink:0;transition:all .15s;}
-#pm-model-arrow:hover{background:#007aff;color:#fff;border-color:#007aff;}
+#pm-model-arrow,#pm-img-model-arrow{background:#f0f0f3;border:1px solid #ddd;border-radius:10px;width:38px;cursor:pointer;font-size:12px;color:#555;flex-shrink:0;transition:all .15s;}
+#pm-model-arrow:hover,#pm-img-model-arrow:hover{background:#007aff;color:#fff;border-color:#007aff;}
 .pm-model-dropdown{position:fixed;z-index:2147483647;background:#fff !important;border:1px solid #ddd !important;border-radius:12px !important;box-shadow:0 8px 24px rgba(0,0,0,.18);overflow:hidden;display:flex;flex-direction:column;min-width:200px;padding:0 !important;margin:0 !important;color:#000 !important;}
 .pm-model-search{border:none !important;border-bottom:1px solid #eee !important;padding:9px 12px !important;outline:none;font-size:13px !important;background:#fafafa !important;color:#000 !important;width:100%;}
 .pm-model-options{overflow-y:auto;max-height:${MODEL_VISIBLE_ROWS * 34}px;}
