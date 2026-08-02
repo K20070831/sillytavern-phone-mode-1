@@ -4062,7 +4062,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     }
 
     function pmNormalizeMemo(o, type) {
-        const cap = type === 'diary' ? 800 : 250;
+        const cap = type === 'diary' ? 1600 : 400;
         const text = String(o && o.text != null ? o.text : '').trim().slice(0, cap);
         let title = String(o && o.title != null ? o.title : '').trim().slice(0, 20);
         if (!title) title = text.split('\n')[0].slice(0, 20) || (type === 'diary' ? '日记' : '备忘');
@@ -4189,7 +4189,7 @@ ${recent}
 
 请以 ${charName} 本人的身份，结合上面的剧情，写${isDiary ? '一篇日记' : '三条备忘'}。${lastWhen ? `\n【日期参考】上一篇写于 ${lastWhen}，when 字段应在这个日期附近（前后数天内），不要跳跃到相差很远的日期。` : ''}
 ${pmMemoSchema(type)}`;
-        const raw = await callAI(pmMemoSystemPrompt(type), userPrompt, { maxTokens: isDiary ? 1500 : 3200 });
+        const raw = await callAI(pmMemoSystemPrompt(type), userPrompt, { maxTokens: isDiary ? 3200 : 3600 });
         const o = wbParseJSON(raw);
         if (isDiary) {
             if (!o.text) throw new Error('AI 没有返回日记内容');
@@ -4320,7 +4320,7 @@ ${pmMemoSchema(type)}`;
             /* ── 列表弹层整体 ── */
             '.pm-memo-modal{background:#f2f2f7!important;height:560px;max-height:88dvh;}',
             '.pm-memo-list-header{padding:18px 18px 6px;flex-shrink:0;display:flex!important;justify-content:space-between!important;align-items:flex-start!important;}',
-            '.pm-memo-list-title{font-size:28px;font-weight:700;color:#1c1c1e;letter-spacing:-.5px;line-height:1.2;}',
+            '.pm-memo-list-title{font-size:21px;font-weight:700;color:#1c1c1e;letter-spacing:-.5px;line-height:1.2;}',
             '.pm-memo-count{font-size:12px;color:#8e8e93;font-variant-numeric:tabular-nums;margin-top:6px;}',
             '.pm-memo-group-sep{height:12px;}',
             /* ── 卡片 ── */
@@ -4480,6 +4480,10 @@ ${pmMemoSchema(type)}`;
     function wbIdentName(ident, acct) {
         if (ident && ident.realName !== undefined) return wbMemberName(ident);
         return wbDefaultName(acct || __pmWeiboAcct);
+    }
+    // 昵称比对用：AI 抄博主昵称时常带 @、全角空格、书名号之类的杂字
+    function wbNormName(s) {
+        return String(s == null ? '' : s).replace(/[\s@＠"'「」『』《》【】\[\]()（）:：]/g, '').toLowerCase();
     }
 
     // ── 名册基础设施结束 ───────────────────────────────────────────
@@ -5488,11 +5492,16 @@ function wbGridHtml(images, clip, pid) {
         const imgs = wbGridHtml(post.images, false, post.id);
 
         // isSelf = 用户自己；isOwner = 这条博文的作者下场回复
+        // AI 常忘记给 by_owner，只是照抄了博主昵称。这时也当博主认，否则头像会退化成按昵称散列的
+        // 随机头像、改头像也跟不上。名字一律现算，不用存下来那份（改昵称后旧回复才不会对不上）
+        const ownerNick = wbNormName(name);
+        const isOwnerC = (x) => !x.isSelf && (x.isOwner || (!!ownerNick && wbNormName(x.name) === ownerNick));
         const cAvatar = (x) => x.isSelf ? wbAvatarFor('me')
-            : (x.isOwner ? wbIdentAvatar(ident, __pmWeiboAcct) : npcAvatarFor(x.name));
+            : (isOwnerC(x) ? wbIdentAvatar(ident, __pmWeiboAcct) : npcAvatarFor(x.name));
         const cV = (x) => x.isSelf ? (self.vType || '')
-            : (x.isOwner ? (ident.vType || '') : (x.v || (x.vip ? 'red' : '')));
-        const cBadge = (x) => x.isOwner ? '<span class="wb-tag-bozhu">博主</span>' : '';
+            : (isOwnerC(x) ? (ident.vType || '') : (x.v || (x.vip ? 'red' : '')));
+        const cBadge = (x) => isOwnerC(x) ? '<span class="wb-tag-bozhu">博主</span>' : '';
+        const cName = (x) => isOwnerC(x) ? name : x.name;
 
         const comments = (post.comments || []).map(c => {
             // 楼中楼也能被回复：回复它时把它的昵称记进 replyTo，渲染成「回复 @某人」
@@ -5510,7 +5519,7 @@ function wbGridHtml(images, clip, pid) {
       <div class="wb-reply">
         ${wbAvatarHtml(cAvatar(r), 'wb-av-24', cV(r))}
         <div class="wb-c-main">
-          <div class="wb-c-name${wbNameCls(cV(r))}">${escapeHtml(r.name)}${cBadge(r)}</div>
+          <div class="wb-c-name${wbNameCls(cV(r))}">${escapeHtml(cName(r))}${cBadge(r)}</div>
           <div class="wb-c-text">${r.replyTo ? `<span class="wb-rt">回复 @${escapeHtml(r.replyTo)}：</span>` : ''}${wbLinkify(r.text)}</div>
           <div class="wb-c-meta">
             <span>${escapeHtml(r.time)}</span>
@@ -5523,7 +5532,7 @@ function wbGridHtml(images, clip, pid) {
             return `<div class="wb-comment">
     ${wbAvatarHtml(cAvatar(c), 'wb-av-32', cV(c))}
     <div class="wb-c-main">
-      <div class="wb-c-name${wbNameCls(cV(c))}">${escapeHtml(c.name)}${cBadge(c)}</div>
+      <div class="wb-c-name${wbNameCls(cV(c))}">${escapeHtml(cName(c))}${cBadge(c)}</div>
       <div class="wb-c-text">${wbLinkify(c.text)}</div>
       <div class="wb-c-meta">
         <span>${escapeHtml(c.time)}${c.ip ? ' · ' + escapeHtml(c.ip) : ''}</span>
@@ -5937,8 +5946,9 @@ function wbGridHtml(images, clip, pid) {
             let success = 0;
             const { ctx } = await wbBuildContext(lockAcct);
             const me = wbSelfName();
-            const acctName = wbDefaultName(lockAcct);
             for (const { post } of targets) {
+                // 昵称必须按这条博文的作者解析：群聊里 wbDefaultName 会返回卡名而不是成员昵称
+                const acctName = wbIdentName(wbAuthorIdent(post, lockAcct), lockAcct);
                 const userPrompt = `【角色卡】
 ${ctx.cardDesc}
 ${ctx.cardPersonality}
