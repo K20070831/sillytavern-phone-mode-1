@@ -4235,7 +4235,7 @@ ${pmMemoSchema(type)}`;
           <div class="pm-memo-card-title">${m.type === 'diary' ? '<span class="pm-memo-tag">日记</span>' : ''}${escapeHtml(m.title)}</div>
           <span class="pm-memo-del" role="button" tabindex="0" onclick="event.stopPropagation();window.__pmMemoDel('${safeJS(m.id)}')">删除</span>
         </div>
-        <div class="pm-memo-card-sub"><span class="pm-memo-card-when">${escapeHtml(m.when || '')}</span>${m.when ? ' ' : ''}<span class="pm-memo-card-pre">${escapeHtml(pmMemoPreview(m.text))}</span></div>
+        <div class="pm-memo-card-sub"><span class="pm-memo-card-when">${escapeHtml(m.when || '')}</span>${m.when ? ' ' : ''}<span class="pm-memo-card-pre">${escapeHtml(pmMemoPreview(pmStripLeadTitle(m.text, m.title)))}</span></div>
       </div>`;
         const body = list.length
             ? groups.map(g => `${g.items.map(renderCard).join('')}`).join('<div class="pm-memo-group-sep"></div>')
@@ -4434,7 +4434,7 @@ ${pmMemoSchema(type)}`;
             window.__pmWeiboIdentity[id].__groupRoster = names.map((n, i) => ({
                 id: `r_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 6)}`,
                 realName: n, name: '', avatar: '', bio: '',
-                tier: 'auto', vType: i === 0 ? 'red' : '', fixedFans: false, fans: [], followed: false,
+                tier: 'auto', vType: 'red', fixedFans: false, fans: [], followed: false,
             }));
             saveWeiboIdentity();
         }
@@ -6418,7 +6418,7 @@ comments 给 6-12 条。每条不超过 50 字。`;
 .wb-form-h{font-size:12px;font-weight:600;color:#ff8200;letter-spacing:.2px;}
 .wb-form-row{display:flex;align-items:center;justify-content:space-between;gap:10px;}
 .wb-form-row span{font-size:13px;}
-.wb-form-note{font-size:11px;color:#777;line-height:1.6;text-wrap:pretty;}
+.wb-form-note{font-size:11px;color:#777;line-height:1.6;}
 .pm-modal.is-dark .wb-form-note{color:#98989d;}
 .wb-alloc-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--wb-line);}
 .wb-alloc-row:last-child{border-bottom:none;}
