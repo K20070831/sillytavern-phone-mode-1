@@ -1218,12 +1218,85 @@
         if (txt) txt.style.display = txt.style.display === 'none' ? 'block' : 'none';
     };
 
+
+    // ── 跨端二进制请求 ────────────────────────────────────
+    // 火山 v3 必须发 X-Api-Key，CORS 白名单不含这个头，浏览器直连必被预检拦死。
+    // SillyTavern 能借后端 /proxy 转发；TauriTavern 无后端，出路是让 Rust 侧发请求。
+    // 返回 { ok, status, contentType, buffer, viaTauri }
+    async function pmFetchBinary(url, { method = 'POST', headers = {}, body } = {}) {
+        const T = window.__TAURI__;
+        if (T && typeof T.http?.fetch === 'function') {
+            // v2 的 http.fetch 与 window.fetch 同签名；v1 的收 Body 包装、回 { status, data }。
+            // 版本未知，先按 v2 发，响应没有 arrayBuffer 就按 v1 的形状读。
+            let r;
+            try {
+                r = await T.http.fetch(url, { method, headers, body });
+            } catch (e) {
+                r = await T.http.fetch(url, {
+                    method, headers,
+                    body: { type: 'Json', payload: typeof body === 'string' ? JSON.parse(body) : body },
+                    responseType: 3, // Binary
+                });
+            }
+            if (typeof r.arrayBuffer === 'function') {
+                return { ok: r.ok, status: r.status, contentType: r.headers?.get?.('Content-Type') || '', buffer: await r.arrayBuffer(), viaTauri: true };
+            }
+            // v1：data 是 number[]（Binary）或已解析的对象
+            const d = r.data;
+            const buf = Array.isArray(d) ? new Uint8Array(d).buffer
+                : typeof d === 'string' ? new TextEncoder().encode(d).buffer
+                : new TextEncoder().encode(JSON.stringify(d ?? '')).buffer;
+            const ctv = r.headers?.['content-type'] || r.headers?.['Content-Type'] || '';
+            return { ok: r.ok ?? (r.status >= 200 && r.status < 300), status: r.status, contentType: Array.isArray(ctv) ? ctv[0] : ctv, buffer: buf, viaTauri: true };
+        }
+        const r = await fetch(url, { method, headers, body });
+        const buf = await r.arrayBuffer().catch(() => new ArrayBuffer(0));
+        return { ok: r.ok, status: r.status, contentType: r.headers.get('Content-Type') || '', buffer: buf, viaTauri: false };
+    }
+
     // ── TTS 模块 ──────────────────────────────────────────
     const __pmTtsCache = new Map(); // key=text → blobURL
     let __pmTtsAudio = null;
 
+    // 每个 provider 一份独立档案
+    const PM_TTS_FIELDS = { url: 'pm-tts-url', key: 'pm-tts-key', appid: 'pm-tts-appid', cluster: 'pm-tts-cluster', voice: 'pm-tts-voice', model: 'pm-tts-model', dbver: 'pm-tts-db-ver' };
+
+    function pmTtsSlots() {
+        const tts = window.__pmConfig.tts || (window.__pmConfig.tts = {});
+        if (!tts.byProvider) tts.byProvider = {};
+        return tts.byProvider;
+    }
+    function pmTtsMigrate() {
+        const tts = window.__pmConfig.tts;
+        if (!tts || tts.byProvider) return;
+        tts.byProvider = {};
+        if (tts.provider) tts.byProvider[tts.provider] = {
+            url: tts.url || '', key: tts.key || '', appid: tts.appid || '',
+            cluster: tts.cluster || '', voice: tts.voice || '', model: tts.model || '', dbver: tts.dbver || 'v3'
+        };
+    }
+    function pmTtsStash(provider) {
+        if (!provider) return;
+        const slot = {};
+        for (const [k, id] of Object.entries(PM_TTS_FIELDS)) slot[k] = document.getElementById(id)?.value.trim() || '';
+        pmTtsSlots()[provider] = slot;
+    }
+    function pmTtsApply(provider) {
+        const slot = pmTtsSlots()[provider] || {};
+        for (const [k, id] of Object.entries(PM_TTS_FIELDS)) {
+            const el = document.getElementById(id); if (!el) continue;
+            el.value = slot[k] || (k === 'dbver' ? 'v3' : '');
+        }
+    }
+
     window.__pmTtsProviderChange = () => {
-        const p = document.getElementById('pm-tts-provider')?.value || '';
+        const sel = document.getElementById('pm-tts-provider');
+        const p = sel?.value || '';
+        if (sel && sel.dataset.loaded !== undefined && sel.dataset.loaded !== p) {
+            pmTtsStash(sel.dataset.loaded);
+            pmTtsApply(p);
+            sel.dataset.loaded = p;
+        }
         // 显示时必须写回 flex：清空 display 会退回 block，让容器上的 gap 失效
         const show = (id, v, mode) => { const el = document.getElementById(id); if (el) el.style.display = v ? (mode || '') : 'none'; };
         const dbVer = document.getElementById('pm-tts-db-ver')?.value || 'v3';
@@ -1247,22 +1320,22 @@
     };
 
     window.__pmTtsUiLoad = () => {
+        pmTtsMigrate();
         const c = window.__pmConfig.tts || {};
         const sel = document.getElementById('pm-tts-provider');
-        if (sel) sel.value = c.provider || '';
-        const f = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
-        f('pm-tts-url', c.url); f('pm-tts-key', c.key);
-        f('pm-tts-appid', c.appid); f('pm-tts-cluster', c.cluster);
-        f('pm-tts-voice', c.voice); f('pm-tts-model', c.model);
-        const dbVerEl = document.getElementById('pm-tts-db-ver');
-        if (dbVerEl) dbVerEl.value = c.dbver || 'v3';
+        // dataset.loaded 必须在这里种下：ProviderChange 靠它判断「provider 真的换了」，
+        // 不设的话那个分支永远进不去，换 provider 就不会换档
+        if (sel) { sel.value = c.provider || ''; sel.dataset.loaded = c.provider || ''; }
+        pmTtsApply(c.provider || '');
         window.__pmTtsProviderChange();
     };
 
     window.__pmTtsSave = () => {
-        const g = id => document.getElementById(id)?.value.trim() || '';
-        const p = g('pm-tts-provider');
-        window.__pmConfig.tts = { provider: p, url: g('pm-tts-url'), key: g('pm-tts-key'), appid: g('pm-tts-appid'), cluster: g('pm-tts-cluster'), voice: g('pm-tts-voice'), model: g('pm-tts-model'), dbver: g('pm-tts-db-ver') || 'v3' };
+        if (!document.getElementById('pm-tts-provider')) return;
+        const p = document.getElementById('pm-tts-provider').value || '';
+        pmTtsStash(p);
+        const cur = window.__pmConfig.tts || {};
+        window.__pmConfig.tts = { ...cur, provider: p, ...(cur.byProvider?.[p] || {}) };
     };
 
     window.__pmTtsPreview = async () => {
@@ -1355,23 +1428,28 @@
             const ver = tts.dbver || 'v3';
             if (ver === 'v3') {
                 // 新版：单头 X-Api-Key 鉴权，音频以 chunked 二进制返回。
-                // 火山 v3 的 CORS 白名单不含 x-api-key，浏览器直连必被预检拦下，
-                // 只能借 ST 的 /proxy 转发（需 config.yaml 的 enableCorsProxy: true）
-                const r = await fetch('/proxy/https://openspeech.bytedance.com/api/v3/tts/unidirectional', {
+                // Tauri 环境走 Rust 侧请求（不过 CORS，可直连火山）；浏览器/ST 环境退回后端 /proxy
+                // 转发（需 config.yaml 的 enableCorsProxy: true），因为 x-api-key 不在火山的 CORS 白名单里。
+                const inTauri = !!(window.__TAURI__ && typeof window.__TAURI__.http?.fetch === 'function');
+                const V3_URL = 'https://openspeech.bytedance.com/api/v3/tts/unidirectional';
+                const r = await pmFetchBinary(inTauri ? V3_URL : `/proxy/${V3_URL}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'X-Api-Key': key, 'X-Api-Resource-Id': 'seed-tts-2.0', 'X-Api-Request-Id': crypto.randomUUID() },
                     body: JSON.stringify({ req_params: { text, speaker: voice || 'zh_female_vv_jupiter_bigtts', audio_params: { format: 'mp3', sample_rate: 24000 } } })
                 });
-                if (r.status === 403) throw new Error('ST 的 CORS 代理未开启：config.yaml 设 enableCorsProxy: true 后重启');
-                if (!r.ok) { const t = await r.text().catch(()=>''); throw new Error(`HTTP ${r.status}: ${t.slice(0,120)}`); }
-                const ct = r.headers.get('Content-Type') || '';
-                if (ct.includes('audio') || ct.includes('octet')) {
-                    return URL.createObjectURL(await r.blob());
+                const raw = r.buffer;
+                if (!r.ok) {
+                    const errTxt = new TextDecoder().decode(raw).slice(0, 120);
+                    if (r.status === 403 && !r.viaTauri) throw new Error('ST 的 CORS 代理未开启：config.yaml 设 enableCorsProxy: true 后重启');
+                    if (r.status === 404 && !r.viaTauri) throw new Error('/proxy 不存在（TauriTavern 无后端）：需 Tauri 放行 openspeech.bytedance.com，或改用旧版 v1');
+                    throw new Error(`HTTP ${r.status}: ${errTxt}`);
                 }
-                // 也可能是 application/json（错误） 或 text/event-stream（SSE）
-                const raw = await r.arrayBuffer();
+                const ct = r.contentType || '';
+                if (ct.includes('audio') || ct.includes('octet')) {
+                    return URL.createObjectURL(new Blob([raw], { type: 'audio/mpeg' }));
+                }
                 // 检测是否是 MP3 magic bytes（0xFF 0xE? 或 0xFF 0xF? 或 ID3）
-                const peek = new Uint8Array(raw, 0, 4);
+                const peek = new Uint8Array(raw, 0, Math.min(4, raw.byteLength));
                 const isMp3 = (peek[0] === 0xFF && (peek[1] & 0xE0) === 0xE0) || (peek[0] === 0x49 && peek[1] === 0x44 && peek[2] === 0x33);
                 if (isMp3) return URL.createObjectURL(new Blob([raw], { type: 'audio/mpeg' }));
                 // 不像音频，按 JSON 处理。chunked/SSE 可能是多行 JSON，每行一段 b64，要拼起来
@@ -1416,20 +1494,163 @@
     const PM_IMG_PER_CHAT = 30;
     const PM_IMG_GLOBAL   = 300;
 
+    // 每个 provider 一份独立档案，切换时不把上一家的 key/地址/模型带过去
+    const PM_IMG_FIELDS = { url: 'pm-img-url', key: 'pm-img-key', model: 'pm-img-model', size: 'pm-img-size', prefix: 'pm-img-prefix' };
+
+
+    function pmImgSlots() {
+        const img = window.__pmConfig.img || (window.__pmConfig.img = {});
+        if (!img.byProvider) img.byProvider = {};
+        return img.byProvider;
+    }
+    // 老版本是扁平的一份配置，首次加载归到当前 provider 名下，免得升级后看着像丢了
+    function pmImgMigrate() {
+        const img = window.__pmConfig.img;
+        if (!img || img.byProvider) return;
+        img.byProvider = {};
+        if (img.provider) img.byProvider[img.provider] = {
+            url: img.url || '', key: img.key || '', model: img.model || '',
+            size: img.size || '1024x1024', prefix: img.prefix || ''
+        };
+    }
+
+    // 外貌预设：{ id, title, body }[]。全局存放而不进 byProvider —— 换生图服务不该丢角色外貌。
+    // activeLook 存的是 id，空串表示「不使用」，默认就是空。
+    function pmLooks() {
+        const img = window.__pmConfig.img || (window.__pmConfig.img = {});
+        if (!Array.isArray(img.looks)) img.looks = [];
+        return img.looks;
+    }
+    function pmLookFind(id) { return pmLooks().find(l => l.id === id) || null; }
+
+    function pmLookRenderSel() {
+        const sel = document.getElementById('pm-img-look'); if (!sel) return;
+        const cur = window.__pmConfig.img?.activeLook || '';
+        sel.innerHTML = `<option value="">— 不使用 —</option>`
+            + pmLooks().map(l => `<option value="${escapeAttr(l.id)}">${escapeHtml(l.title)}</option>`).join('');
+        sel.value = pmLookFind(cur) ? cur : '';
+    }
+
+    // 选中已有预设就把内容显示出来供编辑；选「不使用」则收起编辑区
+    window.__pmLookPick = () => {
+        const sel = document.getElementById('pm-img-look'); if (!sel) return;
+        const id = sel.value;
+        const img = window.__pmConfig.img || (window.__pmConfig.img = {});
+        img.activeLook = id;
+        const box = document.getElementById('pm-look-edit');
+        const newBtn = document.getElementById('pm-look-new-btn');
+        const delBtn = document.getElementById('pm-look-del-btn');
+        const l = pmLookFind(id);
+        if (l) {
+            if (box) box.style.display = 'flex';
+            if (newBtn) newBtn.style.display = 'none';
+            if (delBtn) delBtn.style.display = '';
+            const t = document.getElementById('pm-look-title'), b = document.getElementById('pm-look-body');
+            if (t) t.value = l.title; if (b) b.value = l.body;
+            if (box) box.dataset.editing = id;
+        } else {
+            if (box) { box.style.display = 'none'; box.dataset.editing = ''; }
+            if (newBtn) newBtn.style.display = '';
+        }
+    };
+
+    window.__pmLookNew = () => {
+        const box = document.getElementById('pm-look-edit');
+        const newBtn = document.getElementById('pm-look-new-btn');
+        const delBtn = document.getElementById('pm-look-del-btn');
+        const t = document.getElementById('pm-look-title'), b = document.getElementById('pm-look-body');
+        if (t) t.value = ''; if (b) b.value = '';
+        if (box) { box.style.display = 'flex'; box.dataset.editing = ''; }
+        if (newBtn) newBtn.style.display = 'none';
+        if (delBtn) delBtn.style.display = 'none';
+        t?.focus();
+    };
+
+    window.__pmLookCancel = () => {
+        const box = document.getElementById('pm-look-edit');
+        if (box) { box.style.display = 'none'; box.dataset.editing = ''; }
+        const newBtn = document.getElementById('pm-look-new-btn');
+        if (newBtn) newBtn.style.display = '';
+        pmLookRenderSel();
+    };
+
+    window.__pmLookSave = () => {
+        const t = document.getElementById('pm-look-title')?.value.trim() || '';
+        const b = document.getElementById('pm-look-body')?.value.trim() || '';
+        if (!t) return alert('请填写预设名称');
+        if (!b) return alert('请填写外貌内容');
+        const box = document.getElementById('pm-look-edit');
+        const editing = box?.dataset.editing || '';
+        const looks = pmLooks();
+        let id = editing;
+        if (editing && pmLookFind(editing)) {
+            const l = pmLookFind(editing); l.title = t; l.body = b;
+        } else {
+            if (looks.length >= 20) return alert('最多 20 个预设');
+            id = 'lk' + Date.now().toString(36);
+            looks.push({ id, title: t, body: b });
+        }
+        const img = window.__pmConfig.img;
+        img.activeLook = id;
+        pmLookRenderSel();
+        window.__pmLookPick();
+        try { localStorage.setItem('ST_SMS_CONFIG', JSON.stringify(window.__pmConfig)); } catch (e) {}
+    };
+
+    window.__pmLookDel = () => {
+        const box = document.getElementById('pm-look-edit');
+        const editing = box?.dataset.editing || '';
+        const l = pmLookFind(editing); if (!l) return;
+        if (!confirm(`删除外貌预设「${l.title}」？`)) return;
+        const looks = pmLooks();
+        looks.splice(looks.indexOf(l), 1);
+        const img = window.__pmConfig.img;
+        if (img.activeLook === editing) img.activeLook = '';
+        window.__pmLookCancel();
+        try { localStorage.setItem('ST_SMS_CONFIG', JSON.stringify(window.__pmConfig)); } catch (e) {}
+    };
+    function pmImgStash(provider) {
+        if (!provider) return;
+        const slot = {};
+        for (const [k, id] of Object.entries(PM_IMG_FIELDS)) slot[k] = document.getElementById(id)?.value.trim() || '';
+        pmImgSlots()[provider] = slot;
+    }
+    function pmImgApply(provider) {
+        const slot = pmImgSlots()[provider] || {};
+        for (const [k, id] of Object.entries(PM_IMG_FIELDS)) {
+            const el = document.getElementById(id); if (!el) continue;
+            el.value = slot[k] || (k === 'size' ? '1024x1024' : '');
+        }
+    }
+
     // 未启用时把下面的输入框全收起来，省得看着像要填
     window.__pmImgProviderChange = () => {
-        const p = document.getElementById('pm-img-provider')?.value || '';
+        const sel = document.getElementById('pm-img-provider');
+        const p = sel?.value || '';
+        // provider 真的变了才换档：dbver 那种同 provider 内的 onchange 不该动输入框
+        if (sel && sel.dataset.loaded !== undefined && sel.dataset.loaded !== p) {
+            pmImgStash(sel.dataset.loaded);
+            pmImgApply(p);
+            sel.dataset.loaded = p;
+        }
         // 容器要显式写回 flex：清空 display 会退回 block，让子元素的 flex:1 和容器 gap 一起失效
         const show = (id, v, mode) => { const el = document.getElementById(id); if (el) el.style.display = v ? (mode || '') : 'none'; };
-        show('pm-img-url', p === 'openai');
+        show('pm-img-url', p === 'openai' || p === 'nai');
         show('pm-img-key', !!p);
         show('pm-img-model-wrap', !!p, 'flex');
         show('pm-img-size', !!p);
+        show('pm-img-prefix-wrap', !!p, 'flex');
         show('pm-img-actions', !!p, 'flex');
         // NAI 没有 /models 接口，测试连接无从下手；但模型是固定几个，拉取按钮照样有用
         show('pm-img-test-btn', p !== 'nai');
         show('pm-img-fetch-models-btn', !!p);
         const modelEl = document.getElementById('pm-img-model');
+        const urlEl = document.getElementById('pm-img-url');
+        if (urlEl) {
+            urlEl.placeholder = p === 'nai'
+                ? 'API 地址（留空用 image.novelai.net 官方）'
+                : 'API 地址（留空用 api.openai.com/v1，只填到 /v1）';
+        }
         if (modelEl) {
             if (p === 'openai') modelEl.placeholder = '模型（如 dall-e-3）';
             else if (p === 'siliconflow') modelEl.placeholder = '模型（如 black-forest-labs/FLUX.1-schnell，留空用此默认）';
@@ -1449,20 +1670,33 @@
         const p = document.getElementById('pm-img-provider')?.value || '';
         const rawUrl = document.getElementById('pm-img-url')?.value.trim() || '';
         const key = document.getElementById('pm-img-key')?.value.trim() || '';
+        const model = document.getElementById('pm-img-model')?.value.trim() || '';
         const statusEl = document.getElementById('pm-img-test-status');
         if (!key) { if (statusEl) { statusEl.textContent = '请先填写 API Key'; statusEl.style.color = '#ff9500'; } return; }
-        if (statusEl) { statusEl.textContent = '测试中…'; statusEl.style.color = '#888'; }
+        if (statusEl) { statusEl.textContent = '测试中（发一张 256x256 小图）…'; statusEl.style.color = '#888'; }
         const base = pmImgNormalizeBase(rawUrl, p);
         try {
-            const r = await fetch(`${base}/models`, { headers: { 'Authorization': `Bearer ${key}` }, signal: AbortSignal.timeout(10000) });
-            if (r.ok || r.status === 200) {
+            // 用真实生图请求探活，避免部分中转站 /models 返回 301/404 误报失败
+            let r;
+            if (p === 'nai') {
+                r = await fetch(`${base}/ai/generate-image`, { method: 'POST', signal: AbortSignal.timeout(60000), headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` }, body: JSON.stringify({ model: model || 'nai-diffusion-4-5', action: 'generate', parameters: { prompt: 'test', width: 64, height: 64, n_samples: 1, sampler: 'k_euler', steps: 1 } }) });
+            } else {
+                const sizeParam = p === 'siliconflow' ? { image_size: '1024x1024' } : { size: '256x256', response_format: 'url' };
+                r = await fetch(`${base}/images/generations`, { method: 'POST', signal: AbortSignal.timeout(60000), headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` }, body: JSON.stringify({ model: model || (p === 'siliconflow' ? 'black-forest-labs/FLUX.1-schnell' : 'dall-e-2'), prompt: 'a white circle', n: 1, ...sizeParam }) });
+            }
+            const t = await r.text().catch(() => '');
+            if (r.ok) {
                 if (statusEl) { statusEl.textContent = `✓ 连接成功（${base}）`; statusEl.style.color = '#34c759'; }
             } else {
-                const t = await r.text().catch(() => '');
-                if (statusEl) { statusEl.textContent = `✗ HTTP ${r.status}${t ? ': ' + t.slice(0,80) : ''}`; statusEl.style.color = '#ff3b30'; }
+                // 401/403 说明 key 或权限问题，地址本身是通的
+                if (r.status === 401 || r.status === 403) {
+                    if (statusEl) { statusEl.textContent = `⚠️ 地址可达但 Key 验证失败（${r.status}）`; statusEl.style.color = '#ff9500'; }
+                } else {
+                    if (statusEl) { statusEl.textContent = `✗ HTTP ${r.status}${t ? ': ' + t.slice(0, 80) : ''}`; statusEl.style.color = '#ff3b30'; }
+                }
             }
         } catch (e) {
-            if (statusEl) { statusEl.textContent = `✗ ${e.message}`; statusEl.style.color = '#ff3b30'; }
+            if (statusEl) { statusEl.textContent = `✗ ${e.name === 'TimeoutError' ? '超时（60s）' : e.message}`; statusEl.style.color = '#ff3b30'; }
         }
     };
 
@@ -1534,24 +1768,37 @@
             if (!ids.length) { if (statusEl) { statusEl.textContent = '未返回模型列表'; statusEl.style.color = '#ff9500'; } return; }
             pmImgShowModelList(ids, note, statusEl);
         } catch (e) {
-            if (statusEl) { statusEl.textContent = `✗ ${e.message}`; statusEl.style.color = '#ff3b30'; }
+            // 部分中转站不放行 /models（301 跳转或 404），此时手填模型名照样能生图
+            if (statusEl) { statusEl.textContent = `✗ ${e.message} —— 该站可能不支持模型列表，手填模型名（如 dall-e-3）即可`; statusEl.style.color = '#ff9500'; }
         }
     };
 
     window.__pmImgUiLoad = () => {
+        pmImgMigrate();
         const c = window.__pmConfig.img || {};
-        const f = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
-        f('pm-img-provider', c.provider);
-        f('pm-img-url', c.url);
-        f('pm-img-key', c.key);
-        f('pm-img-model', c.model);
-        f('pm-img-size', c.size || '1024x1024');
+        const sel = document.getElementById('pm-img-provider');
+        if (sel) { sel.value = c.provider || ''; sel.dataset.loaded = c.provider || ''; }
+        pmImgApply(c.provider || '');
+        pmLookRenderSel();
+        window.__pmLookPick();
         window.__pmImgProviderChange();
     };
 
     window.__pmImgSave = () => {
-        const g = id => document.getElementById(id)?.value.trim() || '';
-        window.__pmConfig.img = { provider: g('pm-img-provider'), url: g('pm-img-url'), key: g('pm-img-key'), model: g('pm-img-model'), size: g('pm-img-size') || '1024x1024' };
+        // 弹窗不在场时直接不动配置：从缺失的 DOM 读值会把已存的地址/key 覆盖成空
+        const sel = document.getElementById('pm-img-provider');
+        if (!sel) return;
+        const p = sel.value.trim();
+        pmImgStash(p);
+        // 扁平字段是「当前生效的那一份」，pmImgFetch 直接读它，不用理解档案结构
+        const slot = pmImgSlots()[p] || {};
+        // looks/activeLook 是全局的，不在 PM_IMG_FIELDS 里，所以 slot 展开不会覆盖它们；
+        // 下拉框此刻的选择要收一次，否则选完不按保存就丢
+        const lookSel = document.getElementById('pm-img-look');
+        window.__pmConfig.img = {
+            ...window.__pmConfig.img, provider: p, ...slot, size: slot.size || '1024x1024',
+            ...(lookSel ? { activeLook: lookSel.value } : {})
+        };
     };
 
     async function pmImgLoad() {
@@ -1652,12 +1899,17 @@
         const cfg = window.__pmConfig.img || {};
         if (!cfg.provider) throw new Error('未配置生图 API');
         const [w, h] = (cfg.size || '1024x1024').split('x').map(Number);
+        // 顺序是 画师串 → 外貌 → 描述。外貌只在用户显式选了预设时才拼：
+        // 1girl 那类 tag 是强主体词，混进「咖啡店门口」会直接画出个人来。
+        const prefix = (cfg.prefix || '').trim();
+        const look = (pmLookFind(cfg.activeLook || '')?.body || '').trim();
+        const fullPrompt = [prefix, look, prompt].filter(Boolean).join(', ');
         if (cfg.provider === 'openai') {
             const base = pmImgNormalizeBase(cfg.url, 'openai');
-            const r = await fetch(`${base}/images/generations`, {
-                method: 'POST', signal,
+            const oaPrompt = fullPrompt;
+            const r = await fetch(`${base}/images/generations`, {                method: 'POST', signal,
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.key}` },
-                body: JSON.stringify({ model: cfg.model || 'dall-e-3', prompt, n: 1, size: cfg.size || '1024x1024', response_format: 'b64_json' })
+                body: JSON.stringify({ model: cfg.model || 'dall-e-3', prompt: oaPrompt, n: 1, size: cfg.size || '1024x1024', response_format: 'b64_json' })
             });
             if (!r.ok) { const t = await r.text(); throw new Error(`HTTP ${r.status}: ${t.slice(0, 120)}`); }
             const j = await r.json();
@@ -1673,7 +1925,7 @@
             const r = await fetch(`${base}/images/generations`, {
                 method: 'POST', signal,
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.key}` },
-                body: JSON.stringify({ model: sfModel, prompt, image_size: sfSize, batch_size: 1, num_inference_steps: /schnell/i.test(sfModel) ? 4 : 20, guidance_scale: 7.5 })
+                body: JSON.stringify({ model: sfModel, prompt: fullPrompt, image_size: sfSize, batch_size: 1, num_inference_steps: /schnell/i.test(sfModel) ? 4 : 20, guidance_scale: 7.5 })
             });
             if (!r.ok) { const t = await r.text(); throw new Error(`HTTP ${r.status}: ${t.slice(0, 120)}`); }
             const j = await r.json();
@@ -1682,11 +1934,16 @@
             return await pmImgUrlToData(url, signal);
         }
         if (cfg.provider === 'nai') {
-            const base = (cfg.url || 'https://image.novelai.net').replace(/\/$/, '');
+            // 切换 provider 时隐藏的 URL 框仍会被存下来，这里剥掉 OpenAI 风格的 /v1 和误填的路径后缀，
+            // 否则会拼出 https://<中转站>/v1/ai/generate-image 这种 404 地址
+            const base = (cfg.url || 'https://image.novelai.net')
+                .replace(/\/(ai\/generate-image|images\/generations)\/?$/, '')
+                .replace(/\/v1\/?$/, '')
+                .replace(/\/$/, '') || 'https://image.novelai.net';
             const r = await fetch(`${base}/ai/generate-image`, {
                 method: 'POST', signal,
                 headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.key}` },
-                body: JSON.stringify({ input: prompt, model: cfg.model || 'nai-diffusion-4-5', action: 'generate', parameters: { width: w || 832, height: h || 1216, n_samples: 1, sampler: 'k_euler', steps: 28, scale: 6, noise_schedule: 'karras' } })
+                body: JSON.stringify({ input: fullPrompt, model: cfg.model || 'nai-diffusion-4-5', action: 'generate', parameters: { width: w || 832, height: h || 1216, n_samples: 1, sampler: 'k_euler', steps: 28, scale: 6, noise_schedule: 'karras' } })
             });
             if (!r.ok) { const t = await r.text(); throw new Error(`HTTP ${r.status}: ${t.slice(0, 120)}`); }
             const buf = await r.arrayBuffer();
@@ -1726,8 +1983,13 @@
             // 同步写回 conversationHistory
             const hi = parseInt(el.closest('[data-history-index]')?.dataset.historyIndex ?? '-1');
             if (hi >= 0 && conversationHistory[hi]) {
+                // 分隔符要和 SPECIAL_RE 对齐：只认 `(图片+desc)` 会漏掉
+                // `（图片 desc）`/`（图片：desc）`，那些形式生成后不被标记，重开就退回灰底图。
+                // 关键词只能取图片那一组：用全量 KW_PATTERN 会把同描述的（语音 desc）一起替换掉
+                const descEsc = desc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const imgKw = Object.keys(SPECIAL_KEYWORDS).filter(k => SPECIAL_KEYWORDS[k] === '图片').join('|');
                 conversationHistory[hi].content = conversationHistory[hi].content.replace(
-                    new RegExp(`\\(图片\\+${desc.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\\)`, 'g'),
+                    new RegExp(`[\\(（]\\s*(?:${imgKw})\\s*[+：:\\s]*${descEsc}\\s*[\\)）]`, 'gi'),
                     `(图片已生成:${key})`
                 );
                 saveHistories();
@@ -2928,6 +3190,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     };
 
     window.__pmEditGroup = () => {
+        if (isGenerating) return;
         if (!isGroupChat) {
             showContactConfig(currentPersona);
         } else {
@@ -3476,6 +3739,27 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             <option value="832x1216">832×1216（竖图，NAI 默认）</option>
             <option value="1216x832">1216×832（横图）</option>
           </select>
+          <div id="pm-img-prefix-wrap" style="display:none;flex-direction:column;gap:6px;">
+            <div class="pm-cfg-label" style="font-size:12px;color:#666;">前置提示词（画师串 / 质量词）</div>
+            <textarea id="pm-img-prefix" class="pm-cfg-input" rows="2" placeholder="如 masterpiece, best quality, artist:xxx —— 会拼在每次描述前面" style="resize:vertical;min-height:44px;font-family:inherit;"></textarea>
+            <div class="pm-look-box">
+              <div class="pm-look-head">
+                <span class="pm-cfg-label" style="font-size:12px;color:#666;margin:0;">角色外貌预设</span>
+                <select id="pm-img-look" class="pm-look-sel" onchange="window.__pmLookPick()"></select>
+              </div>
+              <div class="pm-cfg-tip" style="text-align:left;margin:0;">请仅在生成角色照片时选择，画风景 / 物品时保持「不使用」，否则外貌词会把主体带偏。建议用英文书写。</div>
+              <div id="pm-look-edit" style="display:none;flex-direction:column;gap:6px;">
+                <input id="pm-look-title" class="pm-cfg-input" placeholder="预设名称（如 林夏）" maxlength="20">
+                <textarea id="pm-look-body" class="pm-cfg-input" rows="2" placeholder="外貌 tag，如 1girl, long black hair, red eyes" style="resize:vertical;min-height:40px;font-family:inherit;"></textarea>
+                <div class="pm-look-btns">
+                  <button onclick="window.__pmLookSave()" class="pm-look-btn is-primary">保存预设</button>
+                  <button onclick="window.__pmLookDel()" id="pm-look-del-btn" class="pm-look-btn is-danger" style="display:none;">删除</button>
+                  <button onclick="window.__pmLookCancel()" class="pm-look-btn">取消</button>
+                </div>
+              </div>
+              <button onclick="window.__pmLookNew()" id="pm-look-new-btn" class="pm-look-btn" style="width:100%;">➕ 新建外貌预设</button>
+            </div>
+          </div>
           <div id="pm-img-actions" style="display:none;gap:6px;flex-direction:row;flex-wrap:wrap;width:100%;">
             <button id="pm-img-test-btn" onclick="window.__pmImgTest()" style="flex:1;min-width:80px;background:#007aff;color:#fff;border:none;border-radius:9px;padding:7px 10px;font-size:12px;cursor:pointer;font-weight:600;">🔌 测试连接</button>
             <button id="pm-img-fetch-models-btn" onclick="window.__pmImgFetchModels()" style="display:none;flex:1;min-width:80px;background:#5856d6;color:#fff;border:none;border-radius:9px;padding:7px 10px;font-size:12px;cursor:pointer;font-weight:600;">📋 拉取模型</button>
@@ -3529,6 +3813,9 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
     <button onclick="window.__pmSaveConfig()" style="width:100%;background:#007aff;color:#fff;border:none;border-radius:10px;padding:10px;font-size:13px;cursor:pointer;font-weight:600;">保存配置</button>
   </div>
 </div>`);
+        // 必须在这里填一次：保存时是从 DOM 读值的，没填过的隐藏输入框会把配置写成空字符串
+        window.__pmTtsUiLoad();
+        window.__pmImgUiLoad();
     };
 
     window.__pmSwitchTab = (tab) => {
@@ -5424,9 +5711,12 @@ function wbNormImage(x) {
 function wbGridHtml(images, clip, pid) {
         const arr = (images || []).slice(0, 9);
         if (!arr.length) return '';
+        const imgEnabled = !!(window.__pmConfig?.img?.provider);
         const cells = arr.map((d, i) => wbIsImgSrc(d)
             ? `<div class="wb-img is-real"><img src="${escapeAttr(d)}" alt="配图"></div>`
-            : `<div class="wb-img" data-desc="${escapeAttr(d)}" role="button" tabindex="0" onclick="event.stopPropagation();window.__pmGenWbImg(this,'${pid ? escapeAttr(pid) : ''}',${i})" title="点击生成图片"><span>${escapeHtml(d)}</span></div>`).join('');
+            : imgEnabled
+            ? `<div class="wb-img" data-desc="${escapeAttr(d)}" role="button" tabindex="0" onclick="event.stopPropagation();window.__pmGenWbImg(this,'${pid ? escapeAttr(pid) : ''}',${i})" title="点击生成图片"><span>${escapeHtml(d)}</span></div>`
+            : `<div class="wb-img"><span>${escapeHtml(d)}</span></div>`).join('');
         return `<div class="wb-grid${clip ? ' wb-grid-sm' : ''}" data-n="${arr.length}">${cells}</div>`;
     }
 
@@ -6508,6 +6798,23 @@ comments 给 6-12 条。每条不超过 50 字。`;
 /* 状态行：没内容时整行收起，否则空的 min-height 会在按钮和下方说明之间留一道空白 */
 .pm-img-status{font-size:11.5px;color:#888;min-height:16px;padding:0 2px;}
 .pm-img-status:empty{display:none;}
+/* 外貌预设：套在浅灰卡里和上面的画师串拉开层级，避免整块看成一堆并列输入框 */
+.pm-look-box{display:flex;flex-direction:column;gap:8px;background:#f7f7fa;border:1px solid #ececf0;
+  border-radius:12px;padding:11px 12px;margin-top:2px;}
+.pm-look-head{display:flex;align-items:center;gap:8px;}
+.pm-look-sel{flex:1;min-width:0;border:1px solid #e2e2e5;border-radius:9px;padding:7px 9px;
+  font-size:12.5px;background:#fff;color:#000;outline:none;cursor:pointer;}
+.pm-look-sel:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.15);}
+/* 选中了某个预设时给个视觉确认：这是「会被拼进 prompt」的状态 */
+.pm-look-sel.is-on{border-color:#34c759;background:#f2fbf4;font-weight:600;}
+.pm-look-btns{display:flex;gap:6px;}
+.pm-look-btn{flex:1;background:#ececed;color:#1c1c1e;border:none;border-radius:9px;padding:7px 10px;
+  font-size:12px;font-weight:600;cursor:pointer;transition:background .15s;}
+.pm-look-btn:hover{background:#e2e2e4;}
+.pm-look-btn.is-primary{background:#007aff;color:#fff;}
+.pm-look-btn.is-primary:hover{background:#0069d9;}
+.pm-look-btn.is-danger{background:#ffeaea;color:#ff3b30;}
+.pm-look-btn.is-danger:hover{background:#ff3b30;color:#fff;}
 .pm-voice-wrap{display:flex;flex-direction:column;gap:4px;align-items:inherit;}
 .pm-voice-row{display:flex;align-items:center;gap:6px;}
 .pm-special.pm-right .pm-voice-wrap{align-items:flex-end;}.pm-special.pm-left .pm-voice-wrap{align-items:flex-start;}
@@ -6925,6 +7232,22 @@ comments 给 6-12 条。每条不超过 50 字。`;
         return false;
     }
     if (!registerPhoneCommand()) { let t = 0; const i = setInterval(() => { t++; if (registerPhoneCommand() || t >= 30) clearInterval(i); }, 500); }
+
+    // 插件加载时自动在 QR 里建一个 "召唤小手机" 按钮（幂等：已存在就不重复建）
+    async function ensurePhoneQr() {
+        const api = window.quickReplyApi; if (!api) return;
+        const SET_NAME = '召唤小手机';
+        const LABEL = '召唤小手机';
+        try {
+            // 已有同名 set + 同名按钮就直接退出
+            if (api.getSetByName(SET_NAME) && api.getQrByLabel(SET_NAME, LABEL)) return;
+            if (!api.getSetByName(SET_NAME)) await api.createSet(SET_NAME, { disableSend: false });
+            if (!api.getQrByLabel(SET_NAME, LABEL)) api.createQuickReply(SET_NAME, LABEL, { message: '/phone', title: '打开手机模式' });
+            api.addGlobalSet(SET_NAME, true);
+        } catch (e) { console.warn('[phone-mode] QR 建立失败', e); }
+    }
+    // QR 插件可能比 phone-mode 晚一点就绪，轮询等它
+    { let t = 0; const i = setInterval(async () => { t++; if (window.quickReplyApi || t >= 30) { clearInterval(i); await ensurePhoneQr(); } }, 500); }
 
     document.addEventListener('keydown', e => {
         if (e.key !== 'Enter' || e.shiftKey) return;
