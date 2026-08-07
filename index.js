@@ -6624,7 +6624,8 @@ function wbGridHtml(images, clip, pid) {
             const me = wbSelfName();
             for (const { post } of targets) {
                 // 昵称必须按这条博文的作者解析：群聊里 wbDefaultName 会返回卡名而不是成员昵称
-                const acctName = wbIdentName(wbAuthorIdent(post, lockAcct), lockAcct);
+                const postIdent = wbAuthorIdent(post, lockAcct);
+                const acctName = wbIdentName(postIdent, lockAcct);
                 const userPrompt = `【角色卡】
 ${ctx.cardDesc}
 ${ctx.cardPersonality}
@@ -6644,8 +6645,14 @@ ${post.text}
 
 要求：以网友的身份，为这条微博生成 6-12 条主评论。评论要口语化、有生活气息，像真实微博评论区。用户「${me}」是一个普通网友，用户名是其在这个场景中的称呼${wbSelfIdentityText() !== '一个普通网友（无特殊身份）' ? '，身份是：' + wbSelfIdentityText() : ''}。不要每条都夸，可以有调侃、不同意见、玩梗。
 
+【互动数据】${wbTierHint(postIdent)}
+除了评论，还要给这条微博生成点赞数(likes)、转发数(reposts)、以及评论总数(comments_count)。这三个数要符合上面的名气档位、且彼此自洽：真实微博里点赞 > 评论 > 转发，评论总数通常远大于你这次实际写出的几条（多出来的是没展示的），别让它们都是 0 或都相等。
+
 输出 JSON：
 {
+  "likes": 点赞数(整数),
+  "reposts": 转发数(整数),
+  "comments_count": 评论总数(整数，通常比下面 comments 数组的条数大),
   "comments": [
     {"name":"网友昵称","text":"评论内容","ip":"广东","time":"刚刚","likes":3,"vip":false,"replies":[],"manyReplies":false,"replyTotal":0}
   ]
@@ -6655,7 +6662,13 @@ comments 给 6-12 条。每条不超过 50 字。${pmJailbreakTail()}`;
                 const o = wbParseJSON(raw);
                 const cs = Array.isArray(o.comments) ? o.comments : [];
                 post.comments = (post.comments || []).concat(cs.slice(0, 14).map(c => wbNormalizeComment(c)));
-                post.commentsCount = post.comments.length;
+                // 点赞/转发只在 AI 给出更大值时才采纳，避免把已有互动数据改小
+                const aiLikes = Math.max(0, Number(o.likes) || 0);
+                const aiReposts = Math.max(0, Number(o.reposts) || 0);
+                if (aiLikes > (post.likes || 0)) post.likes = aiLikes;
+                if (aiReposts > (post.reposts || 0)) post.reposts = aiReposts;
+                // 评论总数取「AI 给的总数」和「实际展示条数」里的较大者，保证不会小于真实展示的评论
+                post.commentsCount = Math.max(post.comments.length, Math.max(0, Number(o.comments_count) || 0));
                 success++;
             }
             await saveWeiboPosts();
