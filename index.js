@@ -201,8 +201,19 @@
             const idbCount = Object.keys(parsed).length;
             if (idbCount > 0) {
                 if (isStale()) { console.log('[phone-mode] 读 IDB 期间内存已更新，丢弃本次读取'); return; }
-                window.__pmHistories = parsed;
-                try { localStorage.setItem('ST_SMS_DATA_V2', JSON.stringify(parsed)); } catch (e) {
+                // 合并而非替换：IDB 快照可能比内存旧（其他聊天的记录可能只到了 localStorage 还没落 IDB）
+                // 两层合并——内存已有的会话/联系人一律保留，IDB 只补内存里缺的，谁都不覆盖谁
+                const mem = window.__pmHistories || {};
+                const merged = Object.assign({}, parsed);
+                for (const sid of Object.keys(mem)) {
+                    if (merged[sid] && typeof merged[sid] === 'object' && typeof mem[sid] === 'object') {
+                        merged[sid] = Object.assign({}, merged[sid], mem[sid]);
+                    } else {
+                        merged[sid] = mem[sid];
+                    }
+                }
+                window.__pmHistories = merged;
+                try { localStorage.setItem('ST_SMS_DATA_V2', JSON.stringify(merged)); } catch (e) {
                     console.warn('[phone-mode] localStorage 已满，仅使用 IDB 存储');
                 }
                 console.log('[phone-mode] 从 IndexedDB 加载了短信历史，共', idbCount, '个会话');
@@ -3234,6 +3245,8 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
 
     window.__pmEditGroup = () => {
         if (isGenerating) return;
+        // 冷启动期间 currentPersona 可能还是空的，等历史加载完再允许编辑
+        if (!currentPersona) return;
         if (!isGroupChat) {
             showContactConfig(currentPersona);
         } else {
@@ -4361,6 +4374,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
         // 切换前先把当前联系人的最新 conversationHistory 落盘，
         // 修复：调用方（__pmConfirmGroup）可能在调用本函数前已修改了 isGroupChat/currentGroupKey，
         // 导致落盘时 saveKey 错误地指向新目标，把旧聊天记录写入新会话。优先使用调用方传入的 _prevSaveKey。
+        // 防线：只有 conversationHistory 非空时才落盘，避免时序问题导致空数组覆盖存储
         if (currentPersona && conversationHistory.length > 0) {
             if (!window.__pmHistories[id]) window.__pmHistories[id] = {};
             const saveKey = _prevSaveKey || (isGroupChat && currentGroupKey ? currentGroupKey : currentPersona);
