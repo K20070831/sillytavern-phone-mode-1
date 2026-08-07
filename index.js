@@ -5383,7 +5383,7 @@ vip 为 true 表示昵称显示橙色会员色。${needName ? (isMain ? `
         return {
             id: wbUid(),
             name: String(c?.name || '网友').slice(0, 20),
-            text: String(c?.text || '').slice(0, 50),
+            text: String(c?.text || '').slice(0, 120),
             ip: String(c?.ip || '').slice(0, 20),
             time: String(c?.time || '刚刚').slice(0, 30),
             likes: Math.max(0, Number(c?.likes) || 0),
@@ -5396,7 +5396,7 @@ vip 为 true 表示昵称显示橙色会员色。${needName ? (isMain ? `
             replies: (Array.isArray(c?.replies) ? c.replies : []).slice(0, 6).map(r => ({
                 id: wbUid(),
                 name: String(r?.name || '网友').slice(0, 20),
-                text: String(r?.text || '').slice(0, 50),
+                text: String(r?.text || '').slice(0, 120),
                 time: String(r?.time || '刚刚').slice(0, 30),
                 likes: Math.max(0, Number(r?.likes) || 0),
                 replyTo: String(r?.reply_to || '').slice(0, 20),
@@ -5582,8 +5582,7 @@ ${wbFansPrompt(ident)}
             target.replies.push({
                 id: wbUid(),
                 name: String(r.name || '网友').slice(0, 20),
-                // 上限跟 prompt 里说的一致：楼中楼 50 字
-                text: String(r.text || '').slice(0, 50),
+                text: String(r.text || '').slice(0, 120),
                 time: String(r.time || '刚刚').slice(0, 30),
                 likes: Math.max(0, Number(r.likes) || 0),
                 replyTo: String(r.reply_to || '').slice(0, 20),
