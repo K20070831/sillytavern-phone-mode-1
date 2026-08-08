@@ -1216,7 +1216,9 @@
                     ? `<div class="pm-img-card" data-desc="${escapeAttr(m[2].trim())}" role="button" tabindex="0" onclick="window.__pmGenChatImg(this)">🖼️ ${escapeHtml(m[2].trim())}</div>`
                     : `<div class="pm-img-card pm-img-card-disabled">🖼️ ${escapeHtml(m[2].trim())}</div>`;
             } else {
-                const txt = m[2].trim(), len = [...txt].length;
+                // 去掉括号内的形容词描述，如"（小声说）"、"(害羞地)"，只保留要说的话
+                const txt = m[2].trim().replace(/^[\s（(【\[]*[^）)】\]]{1,10}[）)】\]]\s*/g, '').trim() || m[2].trim();
+                const len = [...txt].length;
                 let dur;
                 if (len <= 5) dur = Math.max(1, len);
                 else if (len <= 15) dur = 5 + (len - 5);
@@ -2343,7 +2345,7 @@ ${userMsg.trim() ? `${userName}：${userMsgClean}\n${currentPersona}：` : `[仅
             ].filter(Boolean).join('\n\n');
         }
 
-        const antiFluff = '【务必直接按格式输出短信内容，严禁在开头输出“好的”、“下面是”等任何说明性废话，严禁输出非角色的语言。】';
+        const antiFluff = '【务必直接按格式输出短信内容，严禁在开头输出”好的”、”下面是”等任何说明性废话，严禁输出非角色的语言。语音内容只能是要说的话，严禁在括号内加任何形容词或动作描写（如”（小声说）好的”、”（害羞地）嗯”均为违规格式）。】';
         // 注入表情包提示词
         const targetContactKey = isGroupChat ? currentGroupKey : currentPersona;
         const emojiPrompt = getEmojiPrompt(targetContactKey);
@@ -4903,10 +4905,10 @@ ${pmMemoSchema(type)}${pmJailbreakTail()}`;
         const renderCard = m => `
       <div class="pm-memo-card" role="button" tabindex="0" onclick="window.__pmMemoOpen('${safeJS(m.id)}')">
         <div class="pm-memo-card-top">
-          <div class="pm-memo-card-title">${m.type === 'diary' ? '<span class="pm-memo-tag">日记</span>' : ''}${escapeHtml(m.title)}</div>
+          <div class="pm-memo-card-title">${escapeHtml(m.title)}</div>
           <span class="pm-memo-del" role="button" tabindex="0" onclick="event.stopPropagation();window.__pmMemoDel('${safeJS(m.id)}')">删除</span>
         </div>
-        <div class="pm-memo-card-sub"><span class="pm-memo-card-when">${escapeHtml(m.when || '')}</span>${m.when ? ' ' : ''}<span class="pm-memo-card-pre">${escapeHtml(pmMemoPreview(pmStripLeadTitle(m.text, m.title)))}</span></div>
+        <div class="pm-memo-card-sub">${m.type === 'diary' ? '<span class="pm-memo-tag">日记</span>' : ''}<span class="pm-memo-card-when">${escapeHtml(m.when || '')}</span>${m.when ? ' ' : ''}<span class="pm-memo-card-pre">${escapeHtml(pmMemoPreview(pmStripLeadTitle(m.text, m.title)))}</span></div>
       </div>`;
         const body = list.length
             ? groups.map(g => `${g.items.map(renderCard).join('')}`).join('<div class="pm-memo-group-sep"></div>')
@@ -5697,8 +5699,11 @@ ${wbFansPrompt(ident)}
             // 群聊首次打开时播种名册
             wbRoster(true);
         }
-        const posts = wbPosts(false).slice().reverse();
         const me = wbIsMe();
+        // 「我的」页按点赞从高到低排；其他页仍按时间倒序（新在前）
+        const posts = me
+            ? wbPosts(false).slice().sort((a, b) => (b.likes || 0) - (a.likes || 0))
+            : wbPosts(false).slice().reverse();
         // 群聊大号的"默认空状态"名字用群名；单人用原有逻辑
         const emptyName = isGrp && !me ? (window.__pmGroupMeta?.[getStorageId()]?.[currentGroupKey]?.name || '群聊') : wbDefaultName();
 
